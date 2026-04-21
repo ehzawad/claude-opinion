@@ -28,8 +28,6 @@ mkdir -p ~/.agents/skills
 ln -s "$(pwd)" ~/.agents/skills/claude-opinion
 ```
 
-If you previously installed this skill under `~/.codex/skills/claude-opinion`, install it again under `~/.agents/skills/claude-opinion`; the older path is not the current documented user-level skills location.
-
 Codex usually detects newly installed skills automatically. Restart Codex if `$claude-opinion` does not appear.
 
 ## Usage
