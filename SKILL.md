@@ -1,6 +1,6 @@
 ---
 name: claude-opinion
-description: Second opinion from Claude Code — you, Codex, and Claude in the loop. Invoke /claude-opinion, or naturally via phrases like "ask claude," "second opinion," "another perspective," "claude weigh in," "reconcile with claude."
+description: Second opinion from Claude Code — you, Codex, and Claude in the loop. Invoke $claude-opinion, or naturally via phrases like "ask claude," "second opinion," "another perspective," "claude weigh in," "reconcile with claude."
 ---
 
 # Claude Second Opinion
@@ -12,7 +12,7 @@ Get a second opinion from Claude Code on your current work. Claude uses your con
 Call with your context on stdin. A Claude call takes as long as the work takes; run it in the background (`codex` shell tooling will wait for the exit event) rather than sleep-polling. The script spawns `claude` with `--dangerously-skip-permissions` — Claude can read and write files during the opinion, so don't use this skill on untrusted projects.
 
 ```bash
-echo "<gathered context>" | python3 ~/.codex/skills/claude-opinion/scripts/ask_claude.py
+echo "<gathered context>" | python3 ~/.agents/skills/claude-opinion/scripts/ask_claude.py
 ```
 
 The script appends a default review directive to Claude's system prompt. Pass a positional arg to override it, or `--no-default-instruction` to skip the directive.
@@ -22,7 +22,7 @@ The script appends a default review directive to Claude's system prompt. Pass a 
 If there are uncommitted changes:
 
 ```bash
-git diff HEAD | python3 ~/.codex/skills/claude-opinion/scripts/ask_claude.py
+git diff HEAD | python3 ~/.agents/skills/claude-opinion/scripts/ask_claude.py
 ```
 
 If there are also untracked files that matter, include them (with binary/size guards):
@@ -35,19 +35,19 @@ If there are also untracked files that matter, include them (with binary/size gu
       printf '\n=== %s ===\n' "$f"
       cat "$f"
   done
-} | python3 ~/.codex/skills/claude-opinion/scripts/ask_claude.py
+} | python3 ~/.agents/skills/claude-opinion/scripts/ask_claude.py
 ```
 
 If the tree is clean, gather context yourself:
 
 ```bash
-echo "Review this codebase. Key files: ..." | python3 ~/.codex/skills/claude-opinion/scripts/ask_claude.py
+echo "Review this codebase. Key files: ..." | python3 ~/.agents/skills/claude-opinion/scripts/ask_claude.py
 ```
 
 With a custom instruction:
 
 ```bash
-echo "<context>" | python3 ~/.codex/skills/claude-opinion/scripts/ask_claude.py "user's instruction"
+echo "<context>" | python3 ~/.agents/skills/claude-opinion/scripts/ask_claude.py "user's instruction"
 ```
 
 **Never pipe an empty string.** If `git diff HEAD` would be empty, use echo with gathered context instead.

@@ -13,20 +13,34 @@ Both must be logged in and working in your terminal before using this skill.
 
 ## Install
 
-Symlink (or copy) the skill into Codex's skills directory:
+For a first-time install, clone the skill directly into Codex's user-level skills directory:
 
 ```bash
-git clone https://github.com/ehzawad/claude-opinion.git
-ln -s "$(pwd)/claude-opinion" ~/.codex/skills/claude-opinion
+mkdir -p ~/.agents/skills
+git clone https://github.com/ehzawad/claude-opinion.git ~/.agents/skills/claude-opinion
 ```
+
+This is a user-level install: Codex reads user skills from `$HOME/.agents/skills` and follows symlinked skill folders. If you are developing the skill from a separate checkout, symlink that checkout into the same user-level directory:
+
+```bash
+cd /path/to/claude-opinion
+mkdir -p ~/.agents/skills
+ln -s "$(pwd)" ~/.agents/skills/claude-opinion
+```
+
+If you previously installed this skill under `~/.codex/skills/claude-opinion`, install it again under `~/.agents/skills/claude-opinion`; the older path is not the current documented user-level skills location.
+
+Codex usually detects newly installed skills automatically. Restart Codex if `$claude-opinion` does not appear.
 
 ## Usage
 
-```
-/claude-opinion
+```text
+$claude-opinion
 ```
 
 Or naturally via phrases like "ask claude," "second opinion," "another perspective."
+
+Use `$claude-opinion` for deterministic skill invocation. Codex reserves `/` for built-in slash commands; named skills are invoked via `$`.
 
 ## How it works
 
@@ -41,10 +55,10 @@ sequenceDiagram
     participant S as ask_claude.py
     participant X as Claude Code
 
-    U->>C: /claude-opinion (or natural trigger)
+    U->>C: $claude-opinion (or natural trigger)
     C->>C: Compose adaptive context
     C->>S: Pipe context via stdin
-    S->>X: claude -p --output-format json<br/>(env-stripped; --session-id or --resume)
+    S->>X: claude -p --output-format json<br/>(env stripped, session id or resume)
     X-->>S: {result, is_error, session_id, ...}
     S->>S: Parse outer JSON, check is_error
     S-->>C: Claude's analysis via stdout

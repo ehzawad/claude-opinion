@@ -14,7 +14,7 @@ The script does not interpret Claude's reply semantically, count rounds, or deci
 
 ```mermaid
 flowchart TD
-    A[Invoke /claude-opinion] --> B{Session file exists<br/>for this project?}
+    A[Invoke $claude-opinion] --> B{Session file exists<br/>for this project?}
     B -- Yes --> C[claude -p --resume session_id]
     C --> D{Resume result?}
     D -- Success + result text --> E[Save session metadata<br/>+ return response]
