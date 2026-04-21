@@ -42,7 +42,7 @@ Use `$claude-opinion` for deterministic skill invocation. Codex reserves `/` for
 
 ## How it works
 
-The script ships stdin to Claude via `claude -p --output-format json`, with a short generic review directive riding on `--append-system-prompt`. Stdin stays as pure context. On the first call per project, a fresh session UUID is pre-generated and saved after Claude produces a final answer. Follow-up calls resume the same session via `--resume <uuid>`, so Claude carries accumulated project knowledge across Codex sessions.
+The script ships stdin to Claude via `claude -p --output-format json`, sets the highest supported `--effort` level, and adds a short generic review directive on `--append-system-prompt`. Stdin stays as pure context. On the first call per project, a fresh session UUID is pre-generated and saved after Claude produces a final answer. Follow-up calls resume the same session via `--resume <uuid>`, so Claude carries accumulated project knowledge across Codex sessions.
 
 Codex reconciles Claude's response against its own assessment and reports the reconciled output to the user.
 
@@ -56,7 +56,7 @@ sequenceDiagram
     U->>C: $claude-opinion (or natural trigger)
     C->>C: Compose adaptive context
     C->>S: Pipe context via stdin
-    S->>X: claude -p --output-format json<br/>(env stripped, session id or resume)
+    S->>X: claude -p --output-format json<br/>(env stripped, highest effort, session id or resume)
     X-->>S: {result, is_error, session_id, ...}
     S->>S: Parse outer JSON, check is_error
     S-->>C: Claude's analysis via stdout
@@ -77,7 +77,7 @@ Claude runs with `--dangerously-skip-permissions` — no approval prompts. This 
 
 ## Configuration
 
-The script uses your Claude Code defaults — model, effort, and other settings come from Claude Code's configuration. No model is hardcoded. Permission bypass is overridden by the skill (see Security above).
+The script uses your Claude Code default model and other non-overridden settings. It explicitly selects the highest effort level advertised by the installed Claude CLI: `max` when available, otherwise the next highest known level (`xhigh`, `high`, `medium`, `low`). If the CLI has no `--effort` support, the flag is omitted. No model is hardcoded. Permission bypass is overridden by the skill (see Security above).
 
 No subprocess timeout is enforced. Real failures surface via non-zero exit or a clean exit with no final message (both handled).
 

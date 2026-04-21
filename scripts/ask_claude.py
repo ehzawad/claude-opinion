@@ -1,10 +1,11 @@
 #!/usr/bin/env python3
 """Route a prompt to Claude Code.
 
-Invokes `claude -p --output-format json` with a pre-generated session
-UUID (fresh) or `--resume <uuid>` (follow-up). Stdin passes verbatim as
-the prompt body; the review directive rides on `--append-system-prompt`
-so stdin stays as pure context.
+Invokes `claude -p --output-format json` with the highest supported
+`--effort` level and a pre-generated session UUID (fresh) or
+`--resume <uuid>` (follow-up). Stdin passes verbatim as the prompt body;
+the review directive rides on `--append-system-prompt` so stdin stays as
+pure context.
 
 Strips ANTHROPIC_API_KEY / ANTHROPIC_AUTH_TOKEN / ANTHROPIC_BASE_URL
 from the subprocess env so the Claude.ai subscription wins routing
@@ -26,6 +27,7 @@ Usage:
 import hashlib
 import json
 import os
+import re
 import shutil
 import subprocess
 import sys
@@ -66,6 +68,9 @@ _STALE_RESUME_MARKERS = (
     "conversation not found",
     "session not found",
 )
+
+_EFFORT_LEVELS = ("low", "medium", "high", "xhigh", "max")
+_EFFORT_PREFERENCE = tuple(reversed(_EFFORT_LEVELS))
 
 
 @cache
@@ -146,6 +151,50 @@ def _subprocess_env():
     return {k: v for k, v in os.environ.items() if k not in _STRIP_ENV_VARS}
 
 
+@cache
+def _claude_help_text():
+    try:
+        proc = subprocess.run(
+            ["claude", "--help"],
+            capture_output=True, text=True, env=_subprocess_env(),
+        )
+    except OSError:
+        return ""
+    return "\n".join(part for part in (proc.stdout, proc.stderr) if part)
+
+
+def _supported_efforts_from_help(help_text):
+    if "--effort" not in help_text:
+        return ()
+
+    lines = help_text.splitlines()
+    for idx, line in enumerate(lines):
+        if "--effort" not in line:
+            continue
+        option_lines = [line]
+        for continuation in lines[idx + 1:idx + 3]:
+            if re.match(r"\s*(?:-[A-Za-z0-9],\s*)?--?[A-Za-z]", continuation):
+                break
+            option_lines.append(continuation)
+        option_help = " ".join(option_lines).lower()
+        match = re.search(r"\(([^)]*)\)", option_help)
+        choices_text = match.group(1) if match else option_help
+        tokens = re.split(r"[^a-z]+", choices_text)
+        efforts = tuple(level for level in _EFFORT_LEVELS if level in tokens)
+        if efforts:
+            return efforts
+        return ()
+    return ()
+
+
+def _best_effort_level():
+    supported = set(_supported_efforts_from_help(_claude_help_text()))
+    for level in _EFFORT_PREFERENCE:
+        if level in supported:
+            return level
+    return None
+
+
 def _run_claude_proc(cmd, prompt):
     return subprocess.run(
         cmd, input=prompt, capture_output=True, text=True, env=_subprocess_env(),
@@ -156,9 +205,14 @@ def _base_cmd(project_root, append_system_prompt):
     cmd = [
         "claude", "-p",
         "--output-format", "json",
+    ]
+    effort = _best_effort_level()
+    if effort:
+        cmd.extend(["--effort", effort])
+    cmd.extend([
         "--dangerously-skip-permissions",
         "--add-dir", project_root,
-    ]
+    ])
     if append_system_prompt:
         cmd.extend(["--append-system-prompt", append_system_prompt])
     return cmd

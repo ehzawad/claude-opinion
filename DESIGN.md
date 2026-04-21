@@ -4,7 +4,7 @@ Implementation details for contributors and maintainers. User-facing docs live i
 
 ## Protocol vs transport boundary
 
-The skill layer (how to call Claude, how to build context, session continuity) lives in [`SKILL.md`](SKILL.md); runtime reconciliation is Codex's judgment. [`scripts/ask_claude.py`](scripts/ask_claude.py) is a transport shim: it appends a short default review directive to Claude's system prompt, calls `claude -p --output-format json`, parses the outer JSON, and saves per-project session state atomically. Pass `--no-default-instruction` to skip the system-prompt directive.
+The skill layer (how to call Claude, how to build context, session continuity) lives in [`SKILL.md`](SKILL.md); runtime reconciliation is Codex's judgment. [`scripts/ask_claude.py`](scripts/ask_claude.py) is a transport shim: it appends a short default review directive to Claude's system prompt, calls `claude -p --output-format json` with the highest supported `--effort` level, parses the outer JSON, and saves per-project session state atomically. Pass `--no-default-instruction` to skip the system-prompt directive.
 
 The script strips `ANTHROPIC_API_KEY`, `ANTHROPIC_AUTH_TOKEN`, and `ANTHROPIC_BASE_URL` from the child env so Claude.ai subscription auth wins over API-key or proxy-gateway routing ([anthropics/claude-code#2051](https://github.com/anthropics/claude-code/issues/2051)). Set `CLAUDE_OPINION_KEEP_ANTHROPIC_ENV=1` to opt out. When `CLAUDE_OPINION_SESSION_KEY` is set, the state key includes a hash of that value so that caller gets a separate Claude session for the same project.
 
@@ -40,7 +40,7 @@ sequenceDiagram
     participant S as ask_claude.py
     participant X as Claude Code
 
-    S->>X: claude -p --output-format json<br/>(stdin = context body)
+    S->>X: claude -p --output-format json<br/>--effort highest<br/>(stdin = context body)
     X-->>S: {"result": "...", "is_error": false,<br/>"session_id": "uuid", "total_cost_usd": ..., ...}
     Note over S: _parse_result extracts outer dict
     Note over S: Resume path checks stderr + errors[]<br/>for stale markers before hard-fail

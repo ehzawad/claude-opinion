@@ -5,7 +5,7 @@ description: Second opinion from Claude Code — you, Codex, and Claude in the l
 
 # Claude Second Opinion
 
-Get a second opinion from Claude Code on your current work. Claude uses your configured model and settings.
+Get a second opinion from Claude Code on your current work. Claude uses your configured model, while the script selects the highest effort level supported by the installed Claude CLI.
 
 ## How to call
 

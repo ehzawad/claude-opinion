@@ -168,31 +168,77 @@ class InstructionCompositionTests(unittest.TestCase):
         )
 
 
+class EffortSelectionTests(unittest.TestCase):
+    def test_prefers_max_when_available(self):
+        help_text = "--effort <level> Effort level (low, medium, high, xhigh, max)"
+        with patch.object(ask_claude, "_claude_help_text", return_value=help_text):
+            self.assertEqual(ask_claude._best_effort_level(), "max")
+
+    def test_falls_back_to_highest_available_effort(self):
+        help_text = "--effort <level> Effort level (low, medium, high, xhigh)"
+        with patch.object(ask_claude, "_claude_help_text", return_value=help_text):
+            self.assertEqual(ask_claude._best_effort_level(), "xhigh")
+
+    def test_reads_wrapped_effort_choices(self):
+        help_text = "\n".join((
+            "--effort <level> Effort level for the current session",
+            "  (low, medium, high)",
+            "--max-budget-usd <amount> Maximum dollar amount to spend",
+        ))
+        with patch.object(ask_claude, "_claude_help_text", return_value=help_text):
+            self.assertEqual(ask_claude._best_effort_level(), "high")
+
+    def test_omits_effort_when_cli_has_no_effort_flag(self):
+        with patch.object(ask_claude, "_claude_help_text", return_value="Usage: claude"):
+            self.assertIsNone(ask_claude._best_effort_level())
+
+    def test_does_not_confuse_unrelated_max_flag_for_effort_level(self):
+        help_text = "\n".join((
+            "--effort <level> Effort level for the current session",
+            "--max-budget-usd <amount> Maximum dollar amount to spend",
+        ))
+        with patch.object(ask_claude, "_claude_help_text", return_value=help_text):
+            self.assertIsNone(ask_claude._best_effort_level())
+
+
 class BaseCmdShapeTests(unittest.TestCase):
     def test_core_flags_present(self):
-        cmd = ask_claude._base_cmd("/proj", "Review this")
+        with patch.object(ask_claude, "_best_effort_level", return_value="max"):
+            cmd = ask_claude._base_cmd("/proj", "Review this")
         self.assertIn("claude", cmd)
         self.assertIn("-p", cmd)
         self.assertIn("--output-format", cmd)
         self.assertIn("json", cmd)
+        self.assertIn("--effort", cmd)
+        effort_idx = cmd.index("--effort")
+        self.assertEqual(cmd[effort_idx + 1], "max")
+        self.assertNotIn("--model", cmd)
         self.assertIn("--dangerously-skip-permissions", cmd)
         self.assertIn("--add-dir", cmd)
         self.assertIn("/proj", cmd)
 
     def test_append_system_prompt_included_when_provided(self):
-        cmd = ask_claude._base_cmd("/proj", "Review this")
+        with patch.object(ask_claude, "_best_effort_level", return_value="max"):
+            cmd = ask_claude._base_cmd("/proj", "Review this")
         self.assertIn("--append-system-prompt", cmd)
         idx = cmd.index("--append-system-prompt")
         self.assertEqual(cmd[idx + 1], "Review this")
 
     def test_append_system_prompt_omitted_when_empty(self):
-        cmd = ask_claude._base_cmd("/proj", "")
+        with patch.object(ask_claude, "_best_effort_level", return_value="max"):
+            cmd = ask_claude._base_cmd("/proj", "")
         self.assertNotIn("--append-system-prompt", cmd)
 
     def test_does_not_include_verbose(self):
         # --output-format json does not require --verbose
-        cmd = ask_claude._base_cmd("/proj", "foo")
+        with patch.object(ask_claude, "_best_effort_level", return_value="max"):
+            cmd = ask_claude._base_cmd("/proj", "foo")
         self.assertNotIn("--verbose", cmd)
+
+    def test_omits_effort_when_no_supported_level_found(self):
+        with patch.object(ask_claude, "_best_effort_level", return_value=None):
+            cmd = ask_claude._base_cmd("/proj", "foo")
+        self.assertNotIn("--effort", cmd)
 
 
 class ResultParsingTests(unittest.TestCase):
