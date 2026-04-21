@@ -69,7 +69,9 @@ _STALE_RESUME_MARKERS = (
     "session not found",
 )
 
-_EFFORT_LEVELS = ("low", "medium", "high", "xhigh", "max")
+# _EFFORT_LEVELS = ("low", "medium", "high", "xhigh", "max")
+# Keeping this auto to keep thing simple
+_EFFORT_LEVELS = ("auto")
 _EFFORT_PREFERENCE = tuple(reversed(_EFFORT_LEVELS))
 
 
