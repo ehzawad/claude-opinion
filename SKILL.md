@@ -6,10 +6,12 @@ description: Second opinion from Claude Code — you, Codex, and Claude in the l
 # Claude Second Opinion
 
 Get a second opinion from Claude Code on your current work. Claude uses your configured model, while the script selects the highest effort level supported by the installed Claude CLI.
+Prefer `max` when Claude advertises explicit effort levels; treat `auto` as a fallback, not the preferred choice.
 
 ## How to call
 
 Call with your context on stdin. A Claude call takes as long as the work takes; run it in the background (`codex` shell tooling will wait for the exit event) rather than sleep-polling. The script spawns `claude` with `--dangerously-skip-permissions` — Claude can read and write files during the opinion, so don't use this skill on untrusted projects.
+To update the installed skill itself, run `python3 ~/.agents/skills/claude-opinion/scripts/update_skill.py`.
 
 ```bash
 echo "<gathered context>" | python3 ~/.agents/skills/claude-opinion/scripts/ask_claude.py

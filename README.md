@@ -30,6 +30,22 @@ ln -s "$(pwd)" ~/.agents/skills/claude-opinion
 
 Codex usually detects newly installed skills automatically. Restart Codex if `$claude-opinion` does not appear.
 
+## Update
+
+To update an installed checkout to the latest version:
+
+```bash
+python3 ~/.agents/skills/claude-opinion/scripts/update_skill.py
+```
+
+The updater fast-forwards your local checkout from the remote default branch and refuses to run if that checkout has local edits. If you installed the skill by symlinking a development checkout into `~/.agents/skills`, the updater still works, but it updates the underlying source repo rather than the symlink itself.
+
+You can still update manually with git if you prefer:
+
+```bash
+git -C ~/.agents/skills/claude-opinion pull --ff-only
+```
+
 ## Usage
 
 ```text

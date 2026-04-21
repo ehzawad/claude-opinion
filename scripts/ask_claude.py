@@ -69,10 +69,10 @@ _STALE_RESUME_MARKERS = (
     "session not found",
 )
 
-# _EFFORT_LEVELS = ("low", "medium", "high", "xhigh", "max")
-# Keeping this auto to keep thing simple
-_EFFORT_LEVELS = ("auto")
-_EFFORT_PREFERENCE = tuple(reversed(_EFFORT_LEVELS))
+_EFFORT_LEVELS = ("auto", "low", "medium", "high", "xhigh", "max")
+# Prefer the highest explicit effort when available; only fall back to
+# auto if the installed Claude CLI does not advertise the explicit levels.
+_EFFORT_PREFERENCE = ("max", "xhigh", "high", "medium", "low", "auto")
 
 
 @cache
