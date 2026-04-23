@@ -216,6 +216,7 @@ class BaseCmdShapeTests(unittest.TestCase):
         self.assertIn("--dangerously-skip-permissions", cmd)
         self.assertIn("--add-dir", cmd)
         self.assertIn("/proj", cmd)
+        self.assertNotIn("--bare", cmd)
 
     def test_append_system_prompt_included_when_provided(self):
         with patch.object(ask_claude, "_best_effort_level", return_value="max"):
