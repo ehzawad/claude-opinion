@@ -40,7 +40,11 @@ If there are also untracked files that matter, include them (with binary/size gu
 } | python3 ~/.agents/skills/claude-opinion/scripts/ask_claude.py
 ```
 
-If the tree is clean, gather context yourself:
+If `git rev-parse --show-toplevel` fails and the user gave no target, ask the user what to review. Do not pick a nearby repo by recency, parent directory, or any other heuristic.
+
+If the repo is clean and the user gave no scope, ask whether they want the staged/unstaged diff, a specific file/path, or a full-codebase opinion. Only auto-gather files when the target is explicit or the diff is non-empty.
+
+When gathering context yourself with an explicit target, prefer the narrowest slice the user's request implies. Avoid enumerating `bin/`, `README`, and wrappers unless the user asked for a full review.
 
 ```bash
 echo "Review this codebase. Key files: ..." | python3 ~/.agents/skills/claude-opinion/scripts/ask_claude.py
