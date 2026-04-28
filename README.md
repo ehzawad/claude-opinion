@@ -58,7 +58,7 @@ Use `$claude-opinion` for deterministic skill invocation. Codex reserves `/` for
 
 ## How it works
 
-The script ships stdin to Claude via `claude -p --output-format json`, sets the highest supported `--effort` level, and adds a short generic review directive on `--append-system-prompt`. Stdin stays as pure context. On the first call per project, a fresh session UUID is pre-generated and saved after Claude produces a final answer. Follow-up calls resume the same session via `--resume <uuid>`, so Claude carries accumulated project knowledge across Codex sessions.
+The script ships stdin to Claude via `claude -p --output-format json`, sets the highest supported `--effort` level, and adds a short generic review directive on `--append-system-prompt`. Stdin stays as pure context. On the first call per project, the script lets Claude allocate the session ID and saves the returned `session_id` after Claude produces a final answer. Follow-up calls resume the same session via `--resume <uuid>`, so Claude carries accumulated project knowledge across Codex sessions.
 
 Codex reconciles Claude's response against its own assessment and reports the reconciled output to the user.
 
@@ -72,7 +72,7 @@ sequenceDiagram
     U->>C: $claude-opinion (or natural trigger)
     C->>C: Compose adaptive context
     C->>S: Pipe context via stdin
-    S->>X: claude -p --output-format json<br/>(env stripped, highest effort, session id or resume)
+    S->>X: claude -p --output-format json<br/>(env stripped, highest effort, fresh or resume)
     X-->>S: {result, is_error, session_id, ...}
     S->>S: Parse outer JSON, check is_error
     S-->>C: Claude's analysis via stdout
@@ -100,6 +100,8 @@ No subprocess timeout is enforced. Real failures surface via non-zero exit or a 
 ## Subprocess auth routing
 
 The script strips `ANTHROPIC_API_KEY`, `ANTHROPIC_AUTH_TOKEN`, and `ANTHROPIC_BASE_URL` from the child `claude` process's environment so Claude.ai subscription auth wins over API-key or proxy-gateway routing (see [anthropics/claude-code#2051](https://github.com/anthropics/claude-code/issues/2051)). Without stripping, a present `ANTHROPIC_API_KEY` routes billing to the API key — which may be a different, possibly-empty balance than the subscription.
+
+The script also intentionally does not use `--bare`. Current Claude Code CLI help documents that `--bare` disables OAuth and keychain auth reads, so bare mode cannot use a Claude.ai subscription login.
 
 If you specifically *want* API-key or proxy routing for this skill, set `CLAUDE_OPINION_KEEP_ANTHROPIC_ENV=1` in your environment to skip the strip.
 

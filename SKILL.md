@@ -60,7 +60,7 @@ echo "<context>" | python3 ~/.agents/skills/claude-opinion/scripts/ask_claude.py
 
 ## Session continuity
 
-One Claude session per project, persisted across Codex sessions. Follow-up calls resume the prior Claude session so it keeps its accumulated codebase knowledge. Reframe when the task shifts so prior framing doesn't bias later turns. If the session has expired, the script logs a notice and starts fresh.
+One Claude session per project, persisted across Codex sessions. Fresh calls let Claude allocate the session ID, and follow-up calls resume the prior Claude session so it keeps its accumulated codebase knowledge. Reframe when the task shifts so prior framing doesn't bias later turns. If the session has expired, the script logs a notice and starts fresh.
 
 Set `CLAUDE_OPINION_SESSION_KEY` before launching Codex to isolate a session from the project-wide thread.
 

@@ -2,8 +2,8 @@
 """Route a prompt to Claude Code.
 
 Invokes `claude -p --output-format json` with the highest supported
-`--effort` level and a pre-generated session UUID (fresh) or
-`--resume <uuid>` (follow-up). Stdin passes verbatim as the prompt body;
+`--effort` level and lets Claude assign the session ID on fresh calls,
+then uses `--resume <uuid>` for follow-ups. Stdin passes verbatim as the prompt body;
 the review directive rides on `--append-system-prompt` so stdin stays as
 pure context.
 
@@ -33,7 +33,6 @@ import subprocess
 import sys
 import tempfile
 import time
-import uuid
 from functools import cache
 
 STATE_DIR = os.path.join(
@@ -285,7 +284,7 @@ def run_claude(stdin_content, instruction):
             sys.exit(1)
 
         elif result and result.get("result"):
-            save_session(session_id)
+            save_session(str(result.get("session_id") or session_id))
             return result["result"]
 
         else:
@@ -297,9 +296,10 @@ def run_claude(stdin_content, instruction):
                 print(stderr, file=sys.stderr)
             sys.exit(1)
 
-    # Fresh session: pre-generate UUID, save only after a clean success.
-    new_id = str(uuid.uuid4())
-    cmd = _base_cmd(root, instruction) + ["--session-id", new_id]
+    # Fresh session: let Claude allocate the session ID. Current Claude Code
+    # builds can hang in print mode when a fresh call is forced with
+    # --session-id, while resume-by-ID remains healthy.
+    cmd = _base_cmd(root, instruction)
     proc = _run_claude_proc(cmd, stdin_content)
     stderr = proc.stderr.strip()
 
@@ -335,7 +335,15 @@ def run_claude(stdin_content, instruction):
             print(stderr, file=sys.stderr)
         sys.exit(1)
 
-    save_session(new_id)
+    session_id = result.get("session_id")
+    if not session_id:
+        print(
+            "[claude-opinion] Claude succeeded but did not return a session_id.",
+            file=sys.stderr,
+        )
+        sys.exit(1)
+
+    save_session(str(session_id))
     return text
 
 
