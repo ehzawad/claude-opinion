@@ -10,7 +10,10 @@ Prefer `max` when Claude advertises explicit effort levels; treat `auto` as a fa
 
 ## How to call
 
-Call with your context on stdin. A Claude call takes as long as the work takes; run it in the background (`codex` shell tooling will wait for the exit event) rather than sleep-polling. The script spawns `claude` with `--dangerously-skip-permissions` — Claude can read and write files during the opinion, so don't use this skill on untrusted projects.
+Call with your context on stdin and **wait for the script to exit synchronously**. Codex CLI does not have a "fire and forget + notify on completion" shell mechanism (unlike Claude Code's `Bash run_in_background`); just run the call and let it block. A Claude call with `--effort max` and full file access often takes 1–5 minutes, occasionally longer. The script enforces its own subprocess timeout (`CLAUDE_OPINION_TIMEOUT` env var, default 600s) so it cannot wedge forever — but if Codex's outer per-command timeout is shorter than that, the work will be killed mid-flight. If your Codex environment caps shell commands aggressively, raise that cap before invoking this skill.
+
+The script spawns `claude` with `--dangerously-skip-permissions` — Claude can read and write files during the opinion, so don't use this skill on untrusted projects. The default system-prompt directive instructs Claude to provide analysis only and not modify files. Custom instructions override that directive — when you pass one, restate the read-only constraint if you want it preserved.
+
 To update the installed skill itself, run `python3 ~/.agents/skills/claude-opinion/scripts/update_skill.py`.
 
 ```bash

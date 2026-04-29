@@ -9,9 +9,11 @@ Run from repo root:
     python3 -m unittest discover -s tests -p 'test_*.py'
 """
 
+import io
 import hashlib
 import json
 import os
+import subprocess
 import sys
 import tempfile
 import unittest
@@ -101,6 +103,28 @@ class StateFileRoundtripTests(unittest.TestCase):
                 sid, meta = ask_claude.load_session()
                 self.assertIsNone(sid)
 
+    def test_clear_with_matching_expected_removes(self):
+        with tempfile.TemporaryDirectory() as td:
+            with patch.object(ask_claude, "STATE_DIR", td), \
+                 patch.object(ask_claude, "_project_key", return_value="abc"), \
+                 patch.object(ask_claude, "_project_root", return_value="/p"), \
+                 patch.dict(os.environ, _env_without("CLAUDE_OPINION_SESSION_KEY"), clear=True):
+                ask_claude.save_session("xxx")
+                ask_claude.clear_session(expected_session_id="xxx")
+                sid, _ = ask_claude.load_session()
+                self.assertIsNone(sid)
+
+    def test_clear_with_mismatched_expected_keeps(self):
+        with tempfile.TemporaryDirectory() as td:
+            with patch.object(ask_claude, "STATE_DIR", td), \
+                 patch.object(ask_claude, "_project_key", return_value="abc"), \
+                 patch.object(ask_claude, "_project_root", return_value="/p"), \
+                 patch.dict(os.environ, _env_without("CLAUDE_OPINION_SESSION_KEY"), clear=True):
+                ask_claude.save_session("yyy")
+                ask_claude.clear_session(expected_session_id="xxx")
+                sid, _ = ask_claude.load_session()
+                self.assertEqual(sid, "yyy")
+
 
 class SubprocessEnvTests(unittest.TestCase):
     def test_strips_api_key(self):
@@ -166,6 +190,44 @@ class InstructionCompositionTests(unittest.TestCase):
             ask_claude._instruction_from_args([ask_claude.NO_DEFAULT_FLAG, "override"]),
             "override",
         )
+
+    def test_default_carries_read_only_directive(self):
+        # The skill is "second opinion" and runs with --dangerously-skip-permissions,
+        # so the default instruction tells Claude not to modify files.
+        lowered = ask_claude.DEFAULT_INSTRUCTION.lower()
+        self.assertIn("not modify files", lowered)
+        self.assertIn("analysis only", lowered)
+
+
+class SubprocessTimeoutTests(unittest.TestCase):
+    def test_default_timeout_when_unset(self):
+        with patch.dict(os.environ, _env_without("CLAUDE_OPINION_TIMEOUT"), clear=True):
+            self.assertEqual(ask_claude._subprocess_timeout(), ask_claude._DEFAULT_TIMEOUT_SECONDS)
+
+    def test_timeout_override(self):
+        with patch.dict(os.environ, {"CLAUDE_OPINION_TIMEOUT": "120"}, clear=True):
+            self.assertEqual(ask_claude._subprocess_timeout(), 120)
+
+    def test_invalid_timeout_falls_back_to_default(self):
+        with patch.dict(os.environ, {"CLAUDE_OPINION_TIMEOUT": "abc"}, clear=True):
+            self.assertEqual(ask_claude._subprocess_timeout(), ask_claude._DEFAULT_TIMEOUT_SECONDS)
+
+    def test_zero_or_negative_falls_back_to_default(self):
+        for value in ("0", "-5"):
+            with patch.dict(os.environ, {"CLAUDE_OPINION_TIMEOUT": value}, clear=True):
+                self.assertEqual(ask_claude._subprocess_timeout(), ask_claude._DEFAULT_TIMEOUT_SECONDS)
+
+    def test_run_claude_proc_exits_when_subprocess_times_out(self):
+        # Mocking subprocess.run on the module so the timeout path runs end-to-end
+        timeout_exc = subprocess.TimeoutExpired(cmd=["claude"], timeout=1)
+        stderr = io.StringIO()
+        with patch("ask_claude.subprocess.run", side_effect=timeout_exc), \
+             patch.dict(os.environ, {"CLAUDE_OPINION_TIMEOUT": "1"}, clear=True), \
+             patch("sys.stderr", stderr):
+            with self.assertRaises(SystemExit) as cm:
+                ask_claude._run_claude_proc(["claude", "-p"], "ctx")
+        self.assertEqual(cm.exception.code, 1)
+        self.assertIn("timeout", stderr.getvalue().lower())
 
 
 class EffortSelectionTests(unittest.TestCase):
@@ -301,8 +363,10 @@ class RunClaudeFreshPathTests(unittest.TestCase):
         m.stderr = stderr
         return m
 
-    def test_success_saves_session_and_returns_text(self):
-        fake_stdout = json.dumps({"result": "hello", "is_error": False})
+    def test_success_with_session_id_saves_and_returns_text(self):
+        fake_stdout = json.dumps({
+            "result": "hello", "is_error": False, "session_id": "fresh-uuid",
+        })
         fake_proc = self._fake_proc(fake_stdout)
         with tempfile.TemporaryDirectory() as td:
             with patch.object(ask_claude, "STATE_DIR", td), \
@@ -312,7 +376,25 @@ class RunClaudeFreshPathTests(unittest.TestCase):
                 text = ask_claude.run_claude("ctx", "directive")
                 self.assertEqual(text, "hello")
                 sid, _ = ask_claude.load_session()
-                self.assertTrue(sid)
+                self.assertEqual(sid, "fresh-uuid")
+
+    def test_success_without_session_id_warns_and_returns_text(self):
+        # Don't discard the user's answer just because Claude didn't surface a
+        # session_id; warn, return text, skip persistence.
+        fake_stdout = json.dumps({"result": "hello", "is_error": False})
+        fake_proc = self._fake_proc(fake_stdout)
+        stderr = io.StringIO()
+        with tempfile.TemporaryDirectory() as td:
+            with patch.object(ask_claude, "STATE_DIR", td), \
+                 patch.object(ask_claude, "_project_key", return_value="abc"), \
+                 patch.object(ask_claude, "_project_root", return_value="/p"), \
+                 patch.object(ask_claude, "_run_claude_proc", return_value=fake_proc), \
+                 patch("sys.stderr", stderr):
+                text = ask_claude.run_claude("ctx", "directive")
+                self.assertEqual(text, "hello")
+                sid, _ = ask_claude.load_session()
+                self.assertIsNone(sid)
+        self.assertIn("no session_id", stderr.getvalue())
 
     def test_is_error_exits_non_zero_and_does_not_save(self):
         fake_stdout = json.dumps({"result": "Credit balance is too low", "is_error": True})
@@ -352,7 +434,9 @@ class RunClaudeResumeStaleFallbackTests(unittest.TestCase):
 
     def test_stale_via_stderr_exit_one_falls_through_to_fresh(self):
         stale_proc = self._fake_proc("", returncode=1, stderr="No conversation found with session ID: old")
-        fresh_stdout = json.dumps({"result": "new answer", "is_error": False})
+        fresh_stdout = json.dumps({
+            "result": "new answer", "is_error": False, "session_id": "fresh-uuid",
+        })
         fresh_proc = self._fake_proc(fresh_stdout)
         procs = iter([stale_proc, fresh_proc])
         with tempfile.TemporaryDirectory() as td:
@@ -367,8 +451,7 @@ class RunClaudeResumeStaleFallbackTests(unittest.TestCase):
                 self.assertEqual(text, "new answer")
                 # Fresh UUID should now be stored (not "old")
                 sid, _ = ask_claude.load_session()
-                self.assertIsNotNone(sid)
-                self.assertNotEqual(sid, "old")
+                self.assertEqual(sid, "fresh-uuid")
 
     def test_stale_via_result_errors_exit_zero_falls_through_to_fresh(self):
         stale_stdout = json.dumps({
@@ -377,7 +460,9 @@ class RunClaudeResumeStaleFallbackTests(unittest.TestCase):
             "subtype": "error_during_execution",
         })
         stale_proc = self._fake_proc(stale_stdout, returncode=0)
-        fresh_stdout = json.dumps({"result": "new answer", "is_error": False})
+        fresh_stdout = json.dumps({
+            "result": "new answer", "is_error": False, "session_id": "fresh-uuid",
+        })
         fresh_proc = self._fake_proc(fresh_stdout)
         procs = iter([stale_proc, fresh_proc])
         with tempfile.TemporaryDirectory() as td:
@@ -389,6 +474,8 @@ class RunClaudeResumeStaleFallbackTests(unittest.TestCase):
                 ask_claude.save_session("old")
                 text = ask_claude.run_claude("ctx", "directive")
                 self.assertEqual(text, "new answer")
+                sid, _ = ask_claude.load_session()
+                self.assertEqual(sid, "fresh-uuid")
 
 
 if __name__ == "__main__":

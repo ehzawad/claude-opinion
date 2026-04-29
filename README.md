@@ -81,7 +81,9 @@ sequenceDiagram
 
 ## Session management
 
-One Claude session per project, stored at `$XDG_STATE_HOME/claude-opinion/{project-hash}.json` (default `~/.local/state/claude-opinion/...`). When a saved session is no longer resumable (Claude reports *"no conversation found with session ID …"*), the script clears the state, logs a notice, and starts fresh. Other resume failures surface as hard errors with Claude's stderr.
+One Claude session per project, stored at `$XDG_STATE_HOME/claude-opinion/{project-hash}.json` (default `~/.local/state/claude-opinion/...`). When a saved session is no longer resumable (Claude reports *"no conversation found with session ID …"*), the script clears the state under an `fcntl` lock (compare-and-clear, so a concurrent invocation that has already written a fresh ID is preserved), logs a notice, and starts fresh. Other resume failures surface as hard errors with Claude's stderr.
+
+If a successful call returns a result but no `session_id`, the script prints a warning, returns the answer, and skips the session save — next call starts fresh rather than discarding the user's answer.
 
 Set `CLAUDE_OPINION_SESSION_KEY` before launching Codex to scope state to that session — the state file becomes `{project-hash}-{session-hash}.json` and the session gets its own Claude thread.
 
@@ -89,13 +91,13 @@ See [DESIGN.md](DESIGN.md) for the session-management flowchart and JSON protoco
 
 ## Security
 
-Claude runs with `--dangerously-skip-permissions` — no approval prompts. This gives Claude full read/write access to your machine so it can thoroughly inspect and analyze the current project. Do not use this skill on untrusted projects or with untrusted input.
+Claude runs with `--dangerously-skip-permissions` — no approval prompts. This gives Claude full read/write access to your machine so it can thoroughly inspect and analyze the current project. The default system-prompt directive instructs Claude to provide analysis only and not modify files. Custom instructions (positional arg) override that directive, so if you replace it with something like *"review and fix"* you opt back into mutating runs. Do not use this skill on untrusted projects or with untrusted input.
 
 ## Configuration
 
 The script uses your Claude Code default model and other non-overridden settings. It explicitly selects the highest effort level advertised by the installed Claude CLI: `max` when available, otherwise the next highest known level (`xhigh`, `high`, `medium`, `low`). If the CLI has no `--effort` support, the flag is omitted. No model is hardcoded. Permission bypass is overridden by the skill (see Security above).
 
-No subprocess timeout is enforced. Real failures surface via non-zero exit or a clean exit with no final message (both handled).
+The subprocess is bounded by `CLAUDE_OPINION_TIMEOUT` (env var, default `600` seconds). Set a larger value if you regularly run very long opinions; non-numeric or non-positive values fall back to the default rather than disabling the timeout. On timeout the script kills the child, prints a clear stderr message, and exits non-zero so the parent agent can react.
 
 ## Subprocess auth routing
 

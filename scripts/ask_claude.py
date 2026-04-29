@@ -24,6 +24,8 @@ Usage:
     echo "<context>" | python3 ask_claude.py --no-default-instruction
 """
 
+import contextlib
+import fcntl
 import hashlib
 import json
 import os
@@ -44,10 +46,16 @@ DEFAULT_INSTRUCTION = (
     "Give a thorough second opinion on the context below. "
     "Surface wrong, missing, or incomplete assumptions, trade-offs, and risks. "
     "Prioritize actionable findings; if nothing material stands out, say so clearly. "
-    "Thoroughness beats speed."
+    "Thoroughness beats speed. "
+    "Do not modify files or run mutating commands; provide analysis only."
 )
 
 NO_DEFAULT_FLAG = "--no-default-instruction"
+
+# Default subprocess timeout. Long enough for `claude -p --effort max` work
+# (file reads, web fetches, tool calls) without leaving the script wedged
+# forever if the child hangs. Override via CLAUDE_OPINION_TIMEOUT env var.
+_DEFAULT_TIMEOUT_SECONDS = 600
 
 # Env vars that route away from the Claude.ai subscription. Stripped
 # before every claude -p spawn so subscription auth wins over API-key
@@ -115,35 +123,74 @@ def load_session():
     return None, None
 
 
-def save_session(session_id):
+@contextlib.contextmanager
+def _state_lock():
+    """Hold an exclusive flock during state I/O.
+
+    Serializes concurrent save_session / clear_session invocations on the
+    same project so the `read state -> branch -> write state` sequence in
+    run_claude doesn't race. The lock file lives next to the state file
+    and is released automatically when the fd closes.
+    """
     os.makedirs(STATE_DIR, exist_ok=True)
-    meta = {
-        "session_id": session_id,
-        "project_path": _project_root(),
-        "updated_at": time.strftime("%Y-%m-%dT%H:%M:%SZ", time.gmtime()),
-    }
-    session_key = _session_key()
-    if session_key:
-        meta["session_key"] = session_key
-    path = _state_path()
-    fd, tmp_path = tempfile.mkstemp(prefix=".tmp.", dir=STATE_DIR)
+    lock_path = os.path.join(STATE_DIR, ".lock")
+    fd = os.open(lock_path, os.O_CREAT | os.O_WRONLY, 0o600)
     try:
-        with os.fdopen(fd, "w") as f:
-            json.dump(meta, f, indent=2)
-        os.replace(tmp_path, path)
-    except Exception:
+        fcntl.flock(fd, fcntl.LOCK_EX)
+        yield
+    finally:
         try:
-            os.remove(tmp_path)
+            fcntl.flock(fd, fcntl.LOCK_UN)
         except OSError:
             pass
-        raise
+        os.close(fd)
 
 
-def clear_session():
-    try:
-        os.remove(_state_path())
-    except OSError:
-        pass
+def save_session(session_id):
+    with _state_lock():
+        meta = {
+            "session_id": session_id,
+            "project_path": _project_root(),
+            "updated_at": time.strftime("%Y-%m-%dT%H:%M:%SZ", time.gmtime()),
+        }
+        session_key = _session_key()
+        if session_key:
+            meta["session_key"] = session_key
+        path = _state_path()
+        fd, tmp_path = tempfile.mkstemp(prefix=".tmp.", dir=STATE_DIR)
+        try:
+            with os.fdopen(fd, "w") as f:
+                json.dump(meta, f, indent=2)
+            os.replace(tmp_path, path)
+        except Exception:
+            try:
+                os.remove(tmp_path)
+            except OSError:
+                pass
+            raise
+
+
+def clear_session(expected_session_id=None):
+    """Remove the session state file.
+
+    When `expected_session_id` is provided, this is a compare-and-clear:
+    the file is only removed if its current `session_id` matches. Closes
+    the TOCTOU window where a concurrent invocation may have replaced the
+    stale ID with a fresh one between our read and our delete.
+    """
+    with _state_lock():
+        if expected_session_id is not None:
+            try:
+                with open(_state_path()) as f:
+                    meta = json.load(f)
+                if meta.get("session_id") != expected_session_id:
+                    return
+            except (OSError, json.JSONDecodeError):
+                return
+        try:
+            os.remove(_state_path())
+        except OSError:
+            pass
 
 
 def _subprocess_env():
@@ -196,10 +243,38 @@ def _best_effort_level():
     return None
 
 
+def _subprocess_timeout():
+    """Return the timeout in seconds for the claude -p subprocess.
+
+    Defaults to 600s. Override via CLAUDE_OPINION_TIMEOUT (must be a
+    positive integer; non-numeric or non-positive values fall back to the
+    default rather than disabling the timeout, since Codex's outer shell
+    tool is not a reliable backstop).
+    """
+    raw = os.environ.get("CLAUDE_OPINION_TIMEOUT", "").strip()
+    if not raw:
+        return _DEFAULT_TIMEOUT_SECONDS
+    try:
+        val = int(raw)
+    except ValueError:
+        return _DEFAULT_TIMEOUT_SECONDS
+    return val if val > 0 else _DEFAULT_TIMEOUT_SECONDS
+
+
 def _run_claude_proc(cmd, prompt):
-    return subprocess.run(
-        cmd, input=prompt, capture_output=True, text=True, env=_subprocess_env(),
-    )
+    timeout = _subprocess_timeout()
+    try:
+        return subprocess.run(
+            cmd, input=prompt, capture_output=True, text=True,
+            env=_subprocess_env(), timeout=timeout,
+        )
+    except subprocess.TimeoutExpired:
+        print(
+            f"[claude-opinion] claude -p exceeded {timeout}s timeout. "
+            "Raise CLAUDE_OPINION_TIMEOUT or check whether claude itself is hung.",
+            file=sys.stderr,
+        )
+        sys.exit(1)
 
 
 def _base_cmd(project_root, append_system_prompt):
@@ -263,9 +338,9 @@ def run_claude(stdin_content, instruction):
                 f"[claude-opinion] Session {session_id} (last used {updated}) is stale — starting fresh.",
                 file=sys.stderr,
             )
-            current_id, _ = load_session()
-            if current_id == session_id:
-                clear_session()
+            # Compare-and-clear: if a concurrent invocation already wrote a
+            # fresh session_id, leave it alone.
+            clear_session(expected_session_id=session_id)
             # fall through to fresh branch below
 
         elif proc.returncode != 0:
@@ -336,14 +411,16 @@ def run_claude(stdin_content, instruction):
         sys.exit(1)
 
     session_id = result.get("session_id")
-    if not session_id:
+    if session_id:
+        save_session(str(session_id))
+    else:
+        # Don't discard the user's answer just because resume isn't possible
+        # next time. Surface it as a warning and skip persistence.
         print(
-            "[claude-opinion] Claude succeeded but did not return a session_id.",
+            "[claude-opinion] Claude returned a result but no session_id; "
+            "next call will start a fresh session.",
             file=sys.stderr,
         )
-        sys.exit(1)
-
-    save_session(str(session_id))
     return text
 
 
