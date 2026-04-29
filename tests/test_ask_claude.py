@@ -158,6 +158,76 @@ class StateFileRoundtripTests(unittest.TestCase):
                 sid, _ = ask_claude.load_session()
                 self.assertEqual(sid, "fresh")
 
+    def test_load_quarantine_uses_unique_suffixes_under_burst(self):
+        # Two corrupt-state events in rapid succession must produce
+        # distinct quarantine filenames so neither overwrites the other.
+        # int(time.time()) granularity (1s) was insufficient; time_ns + pid is.
+        with tempfile.TemporaryDirectory() as td:
+            with patch.object(ask_claude, "STATE_DIR", td), \
+                 patch.object(ask_claude, "_project_key", return_value="abc"), \
+                 patch.object(ask_claude, "_project_root", return_value="/p"), \
+                 patch.dict(os.environ, _env_without("CLAUDE_OPINION_SESSION_KEY"), clear=True), \
+                 patch("sys.stderr", io.StringIO()):
+                state_path = ask_claude._state_path()
+                with open(state_path, "w") as f:
+                    f.write("first corrupt")
+                ask_claude.load_session()
+                with open(state_path, "w") as f:
+                    f.write("second corrupt")
+                ask_claude.load_session()
+                quarantined = sorted(
+                    n for n in os.listdir(td)
+                    if n.startswith(os.path.basename(state_path) + ".corrupt.")
+                )
+                self.assertEqual(len(quarantined), 2)
+                # Confirm both bodies preserved — neither displaced the other
+                bodies = set()
+                for n in quarantined:
+                    with open(os.path.join(td, n)) as f:
+                        bodies.add(f.read())
+                self.assertEqual(bodies, {"first corrupt", "second corrupt"})
+
+    def test_load_raises_when_quarantine_rename_fails(self):
+        # If the quarantine rename can't proceed (perms, FS issue) the
+        # caller must abort before spending on a `claude -p` call that
+        # save_session won't be able to persist on the same corrupt file.
+        with tempfile.TemporaryDirectory() as td:
+            with patch.object(ask_claude, "STATE_DIR", td), \
+                 patch.object(ask_claude, "_project_key", return_value="abc"), \
+                 patch.object(ask_claude, "_project_root", return_value="/p"), \
+                 patch.dict(os.environ, _env_without("CLAUDE_OPINION_SESSION_KEY"), clear=True), \
+                 patch("ask_claude.os.rename",
+                       side_effect=PermissionError("read-only fs")):
+                with open(ask_claude._state_path(), "w") as f:
+                    f.write("garbage")
+                with self.assertRaises(ask_claude._CorruptStateUnrecoverable):
+                    ask_claude.load_session()
+
+    def test_load_session_holds_state_lock(self):
+        # Without the lock, a sibling's valid save between our failed parse
+        # and our rename would cause us to quarantine the sibling's good
+        # data. We cover the contract by asserting _state_lock is entered
+        # for the duration of the load.
+        import contextlib
+        entered = []
+        exited = []
+
+        @contextlib.contextmanager
+        def tracking_lock():
+            entered.append(True)
+            yield
+            exited.append(True)
+
+        with tempfile.TemporaryDirectory() as td:
+            with patch.object(ask_claude, "STATE_DIR", td), \
+                 patch.object(ask_claude, "_project_key", return_value="abc"), \
+                 patch.object(ask_claude, "_project_root", return_value="/p"), \
+                 patch.object(ask_claude, "_state_lock", tracking_lock), \
+                 patch.dict(os.environ, _env_without("CLAUDE_OPINION_SESSION_KEY"), clear=True):
+                ask_claude.load_session()
+        self.assertEqual(len(entered), 1)
+        self.assertEqual(len(exited), 1)
+
     def test_clear_with_mismatched_expected_keeps(self):
         with tempfile.TemporaryDirectory() as td:
             with patch.object(ask_claude, "STATE_DIR", td), \

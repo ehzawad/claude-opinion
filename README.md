@@ -58,7 +58,7 @@ Use `$claude-opinion` for deterministic skill invocation. Codex reserves `/` for
 
 ## How it works
 
-The script ships stdin to Claude via `claude -p --output-format json`, sets the highest supported `--effort` level, and adds a short generic review directive on `--append-system-prompt`. Stdin stays as pure context. On the first call per project, the script lets Claude allocate the session ID and saves the returned `session_id` after Claude produces a final answer. Follow-up calls resume the same session via `--resume <uuid>`, so Claude carries accumulated project knowledge across Codex sessions.
+The script ships stdin to Claude via `claude -p --output-format json`, sets the highest supported `--effort` level, and adds a short generic review directive on `--append-system-prompt`. Stdin stays as pure context. On the first call per project, the script lets Claude allocate the session ID and persists the returned `session_id` (via compare-and-save — see Session management below). Follow-up calls resume the same session via `--resume <uuid>`, so Claude carries accumulated project knowledge across Codex sessions.
 
 Codex reconciles Claude's response against its own assessment and reports the reconciled output to the user.
 
@@ -89,7 +89,9 @@ One Claude session per project, stored at `$XDG_STATE_HOME/claude-opinion/{proje
 
 If a successful call returns a result but no `session_id`, the script prints a warning, returns the answer, and skips the session save — next call starts fresh rather than discarding the user's answer.
 
-If the state file becomes corrupt (e.g. JSON garbled by an external writer or another tool's crash), the next call quarantines it under `{project-hash}.json.corrupt.{timestamp}` and warns with the full path. The follow-up save persists a fresh session_id normally — the corrupt file is preserved for inspection rather than silently overwritten or trapped in a fresh-then-refuse-save loop.
+If the state file becomes corrupt (e.g. JSON garbled by an external writer or another tool's crash), the next call quarantines it under `{project-hash}.json.corrupt.{nanoseconds}.{pid}` and warns with the full path. The follow-up save persists a fresh session_id normally — the corrupt file is preserved for inspection rather than silently overwritten or trapped in a fresh-then-refuse-save loop. The whole load/quarantine sequence runs under the state lock so a sibling save can't slip valid data in between the failed parse and the rename.
+
+If the rename itself fails (e.g. directory permissions, read-only FS), the script aborts with an error rather than spending on a `claude -p` call that won't be persistable; remove or fix the state directory and rerun.
 
 Other resume failures surface as hard errors with Claude's stderr.
 

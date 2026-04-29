@@ -132,6 +132,12 @@ def _state_path():
     return os.path.join(STATE_DIR, f"{_project_key()}.json")
 
 
+class _CorruptStateUnrecoverable(Exception):
+    """Corrupt state was detected but quarantine failed (e.g. directory
+    perms blocked the rename). Safe recovery requires human inspection;
+    proceeding to spawn `claude -p` would burn a call we can't persist."""
+
+
 def load_session():
     """Load session metadata, or quarantine and return None on corruption.
 
@@ -141,33 +147,49 @@ def load_session():
     a fresh `claude -p` runs successfully, then save_session refuses to
     overwrite the unreadable file. We break that doom loop here by renaming
     the corrupt file aside (preserving evidence for inspection) so the
-    follow-up save can persist a new session_id normally. Plain I/O errors
-    (permissions, etc.) stay silent — they're outside our recovery scope.
+    follow-up save can persist a new session_id normally.
+
+    The whole open → parse → quarantine sequence runs under `_state_lock`
+    so a sibling save can't slip a *valid* fresh state in between our
+    failed parse and our rename — without the lock, that interleaving
+    would cause us to quarantine the sibling's good data.
+
+    Plain I/O errors (permissions on the file itself, etc.) stay silent —
+    they're outside our recovery scope. A failed quarantine raises
+    `_CorruptStateUnrecoverable` so the caller can abort before spending
+    on a `claude -p` call that won't be able to persist anyway.
     """
     state_path = _state_path()
-    try:
-        with open(state_path) as f:
-            meta = json.load(f)
-            sid = meta.get("session_id")
-            if sid:
-                return sid, meta
-    except FileNotFoundError:
-        pass
-    except OSError:
-        pass
-    except json.JSONDecodeError:
+    with _state_lock():
         try:
-            quarantine_path = f"{state_path}.corrupt.{int(time.time())}"
-            os.rename(state_path, quarantine_path)
+            with open(state_path) as f:
+                meta = json.load(f)
+                sid = meta.get("session_id")
+                if sid:
+                    return sid, meta
+        except FileNotFoundError:
+            pass
+        except OSError:
+            pass
+        except json.JSONDecodeError:
+            # time.time_ns + pid: nanosecond resolution + per-process
+            # suffix makes target-name collisions practically impossible
+            # even under burst corruption from multiple processes. Without
+            # both, two events in the same second on POSIX would let
+            # os.rename silently overwrite preserved evidence.
+            quarantine_path = (
+                f"{state_path}.corrupt.{time.time_ns()}.{os.getpid()}"
+            )
+            try:
+                os.rename(state_path, quarantine_path)
+            except OSError as e:
+                raise _CorruptStateUnrecoverable(
+                    f"State file at {state_path} is corrupt and could not "
+                    f"be quarantined ({e}); manual cleanup required."
+                )
             print(
                 f"[claude-opinion] State file at {state_path} was corrupt; "
                 f"moved to {quarantine_path} and starting fresh.",
-                file=sys.stderr,
-            )
-        except OSError as e:
-            print(
-                f"[claude-opinion] State file at {state_path} is corrupt and "
-                f"could not be quarantined ({e}); manual cleanup required.",
                 file=sys.stderr,
             )
     return None, None
@@ -447,7 +469,12 @@ def _is_stale_resume(result):
 
 def run_claude(stdin_content, instruction):
     root = _project_root()
-    session_id, meta = load_session()
+    try:
+        session_id, meta = load_session()
+    except _CorruptStateUnrecoverable as e:
+        # Don't burn a `claude -p` call we can't persist anyway.
+        print(f"[claude-opinion] {e}", file=sys.stderr)
+        sys.exit(1)
     # Capture the state generation we observed at entry. Used for the
     # compare-and-save guard on the fresh path so a parallel invocation
     # that has already written a different fresh ID isn't clobbered.
