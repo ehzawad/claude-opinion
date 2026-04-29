@@ -127,8 +127,9 @@ class StateFileRoundtripTests(unittest.TestCase):
 
 
 class CompareAndSaveTests(unittest.TestCase):
-    """Generation-aware save_session — closes the fresh-save race where two
-    parallel invocations would otherwise overwrite each other's fresh IDs."""
+    """Generation-aware save_session — closes save-races on both fresh and
+    resume-success paths where parallel invocations would otherwise
+    overwrite each other's session IDs."""
 
     def _ctx(self, td):
         return [
@@ -210,6 +211,57 @@ class CompareAndSaveTests(unittest.TestCase):
                 self.assertFalse(wrote)
                 sid, _ = ask_claude.load_session()
                 self.assertEqual(sid, "recent-other")
+
+    def test_save_with_current_matching_session_id_is_noop_success(self):
+        # Sibling racers landing on the same rotated ID: state already
+        # holds what we'd write, so accept it as a no-op success rather
+        # than firing the "concurrent overwrite" warning.
+        with tempfile.TemporaryDirectory() as td:
+            with patch.object(ask_claude, "STATE_DIR", td), \
+                 patch.object(ask_claude, "_project_key", return_value="abc"), \
+                 patch.object(ask_claude, "_project_root", return_value="/p"), \
+                 patch.dict(os.environ, _env_without("CLAUDE_OPINION_SESSION_KEY"), clear=True):
+                ask_claude.save_session("rotated")  # racer A wrote first
+                # Racer B observed prior="old", got rotated_id="rotated", state already holds it.
+                wrote = ask_claude.save_session("rotated", expected_prior="old")
+                self.assertTrue(wrote)
+                sid, _ = ask_claude.load_session()
+                self.assertEqual(sid, "rotated")
+
+    def test_save_refuses_on_corrupt_state_with_prior(self):
+        # Atomic os.replace means this script cannot produce invalid JSON
+        # itself. If we encounter it, refuse rather than silently overwrite —
+        # external interference shouldn't be masked.
+        with tempfile.TemporaryDirectory() as td:
+            with patch.object(ask_claude, "STATE_DIR", td), \
+                 patch.object(ask_claude, "_project_key", return_value="abc"), \
+                 patch.object(ask_claude, "_project_root", return_value="/p"), \
+                 patch.dict(os.environ, _env_without("CLAUDE_OPINION_SESSION_KEY"), clear=True):
+                with open(ask_claude._state_path(), "w") as f:
+                    f.write("not valid json {{{")
+                stderr = io.StringIO()
+                with patch("sys.stderr", stderr):
+                    wrote = ask_claude.save_session("mine", expected_prior="old")
+                self.assertFalse(wrote)
+                self.assertIn("unreadable", stderr.getvalue().lower())
+                # Corrupt file must be left in place for human inspection.
+                with open(ask_claude._state_path()) as f:
+                    self.assertEqual(f.read(), "not valid json {{{")
+
+    def test_unconditional_save_ignores_corrupt_existing_state(self):
+        # When called without expected_prior the function bypasses the read,
+        # so corruption isn't a concern — the atomic write replaces it.
+        with tempfile.TemporaryDirectory() as td:
+            with patch.object(ask_claude, "STATE_DIR", td), \
+                 patch.object(ask_claude, "_project_key", return_value="abc"), \
+                 patch.object(ask_claude, "_project_root", return_value="/p"), \
+                 patch.dict(os.environ, _env_without("CLAUDE_OPINION_SESSION_KEY"), clear=True):
+                with open(ask_claude._state_path(), "w") as f:
+                    f.write("garbage")
+                wrote = ask_claude.save_session("clean")
+                self.assertTrue(wrote)
+                sid, _ = ask_claude.load_session()
+                self.assertEqual(sid, "clean")
 
 
 class SubprocessEnvTests(unittest.TestCase):
@@ -359,6 +411,24 @@ class SubprocessTimeoutTests(unittest.TestCase):
                 self.assertEqual(ask_claude._claude_help_text(), "")
         finally:
             ask_claude._claude_help_text.cache_clear()
+
+    def test_run_claude_proc_uses_start_new_session(self):
+        # Process-tree timeout depends on Popen creating a new process group
+        # (start_new_session=True); without it os.killpg can't reach
+        # grandchildren spawned by claude during -p execution.
+        fake_proc = MagicMock()
+        fake_proc.returncode = 0
+        fake_proc.communicate.return_value = ("out", "")
+        captured = {}
+
+        def fake_popen(cmd, **kwargs):
+            captured.update(kwargs)
+            return fake_proc
+
+        with patch("ask_claude.subprocess.Popen", side_effect=fake_popen), \
+             patch.dict(os.environ, _env_without("CLAUDE_OPINION_TIMEOUT"), clear=True):
+            ask_claude._run_claude_proc(["claude", "-p"], "ctx")
+        self.assertTrue(captured.get("start_new_session"))
 
 
 class EffortSelectionTests(unittest.TestCase):
@@ -576,6 +646,66 @@ class RunClaudeFreshPathTests(unittest.TestCase):
                  patch("sys.stderr", stderr):
                 text = ask_claude.run_claude("ctx", "directive")
                 self.assertEqual(text, "mine")
+                sid, _ = ask_claude.load_session()
+                self.assertEqual(sid, "fresh-other")  # not clobbered
+        self.assertIn("Concurrent invocation", stderr.getvalue())
+
+
+class RunClaudeResumeSuccessTests(unittest.TestCase):
+    """Resume-success path also uses compare-and-save so a sibling
+    invocation that has written a different ID isn't clobbered."""
+
+    def _fake_proc(self, stdout, returncode=0, stderr=""):
+        m = MagicMock()
+        m.stdout = stdout
+        m.returncode = returncode
+        m.stderr = stderr
+        return m
+
+    def test_resume_success_save_succeeds_when_state_unchanged(self):
+        # Vanilla resume-success: state still holds "old" at exit, so the
+        # compare-and-save with expected_prior="old" passes.
+        fake_stdout = json.dumps({
+            "result": "resumed answer", "is_error": False, "session_id": "old-rotated",
+        })
+        fake_proc = self._fake_proc(fake_stdout)
+        with tempfile.TemporaryDirectory() as td:
+            with patch.object(ask_claude, "STATE_DIR", td), \
+                 patch.object(ask_claude, "_project_key", return_value="abc"), \
+                 patch.object(ask_claude, "_project_root", return_value="/p"), \
+                 patch.object(ask_claude, "_run_claude_proc", return_value=fake_proc), \
+                 patch.dict(os.environ, _env_without("CLAUDE_OPINION_SESSION_KEY"), clear=True):
+                ask_claude.save_session("old")
+                text = ask_claude.run_claude("ctx", "directive")
+                self.assertEqual(text, "resumed answer")
+                sid, _ = ask_claude.load_session()
+                self.assertEqual(sid, "old-rotated")
+
+    def test_resume_success_refuses_to_clobber_concurrent_writer(self):
+        # While we're blocked in claude --resume, another invocation persists
+        # a different fresh/resumed ID. We return our text but must NOT
+        # overwrite the state with our (now-shadowed) resume result.
+        fake_stdout = json.dumps({
+            "result": "resumed answer", "is_error": False, "session_id": "old-rotated",
+        })
+        fake_proc = self._fake_proc(fake_stdout)
+
+        def side_effect_with_concurrent_write(*args, **kwargs):
+            ask_claude.save_session("fresh-other")
+            return fake_proc
+
+        stderr = io.StringIO()
+        with tempfile.TemporaryDirectory() as td:
+            with patch.object(ask_claude, "STATE_DIR", td), \
+                 patch.object(ask_claude, "_project_key", return_value="abc"), \
+                 patch.object(ask_claude, "_project_root", return_value="/p"), \
+                 patch.object(ask_claude, "_run_claude_proc",
+                              side_effect=side_effect_with_concurrent_write), \
+                 patch.dict(os.environ, _env_without("CLAUDE_OPINION_SESSION_KEY"), clear=True), \
+                 patch("sys.stderr", stderr):
+                ask_claude.save_session("old")
+                text = ask_claude.run_claude("ctx", "directive")
+                self.assertEqual(text, "resumed answer")
                 sid, _ = ask_claude.load_session()
                 self.assertEqual(sid, "fresh-other")  # not clobbered
         self.assertIn("Concurrent invocation", stderr.getvalue())

@@ -171,29 +171,46 @@ def save_session(session_id, expected_prior=_UNCHECKED):
     """Persist session metadata atomically; optionally guard against races.
 
     When `expected_prior` is left as `_UNCHECKED` (the default), the save is
-    unconditional — last writer wins. This is the right behavior on the
-    resume-success path, where both racers would be writing the same alive
-    session ID anyway.
+    unconditional — last writer wins.
 
     When `expected_prior` is provided (including `None`), the save is a
     compare-and-save: it only writes if the current state's `session_id`
-    matches `expected_prior` *or* there is no state file. This closes the
-    fresh-save race where two parallel invocations would otherwise both
-    overwrite each other's freshly-allocated session IDs.
+    matches `expected_prior` *or* the state file is missing (treated as
+    "no concurrent writer"). This is used on both fresh and resume-success
+    paths so a parallel invocation that has already persisted a different
+    ID isn't clobbered. A current value equal to `session_id` itself is also
+    accepted as a no-op success.
 
-    Returns True if the write happened, False if it was skipped because a
-    concurrent invocation already wrote a different session_id.
+    A corrupt or unreadable existing state file does NOT collapse to the
+    "missing" case: with atomic os.replace writes this script cannot produce
+    invalid JSON itself, so corruption implies external interference and we
+    refuse to overwrite rather than masking the problem.
+
+    Returns True if the write happened (or the no-op match), False if it was
+    skipped because a concurrent invocation already wrote a different
+    session_id or the existing state was unreadable.
     """
     with _state_lock():
         if expected_prior is not _UNCHECKED:
             try:
                 with open(_state_path()) as f:
                     current = json.load(f).get("session_id")
-            except (OSError, json.JSONDecodeError):
+            except FileNotFoundError:
                 current = None
-            # `current is None` means empty/unreadable state — treat as
-            # "no concurrent writer" and proceed. Otherwise it must match.
-            if current is not None and current != expected_prior:
+            except (OSError, json.JSONDecodeError) as e:
+                print(
+                    f"[claude-opinion] State file unreadable ({type(e).__name__}); "
+                    "refusing to overwrite. Inspect or remove it manually.",
+                    file=sys.stderr,
+                )
+                return False
+            # current==None: empty state, no concurrent writer → proceed.
+            # current==expected_prior: state matches what we observed → proceed.
+            # current==session_id: someone wrote the same ID → no-op success.
+            # otherwise: a concurrent invocation persisted a different ID → refuse.
+            if (current is not None
+                    and current != expected_prior
+                    and current != session_id):
                 return False
         meta = {
             "session_id": session_id,
@@ -445,9 +462,17 @@ def run_claude(stdin_content, instruction):
             sys.exit(1)
 
         elif result and result.get("result"):
-            # Resume-success: last-writer-wins is fine here because both
-            # racers would be writing the same alive session ID.
-            save_session(str(result.get("session_id") or session_id))
+            # Resume-success: also compare-and-save. Claude can rotate the
+            # session ID on resume, and a parallel invocation may have
+            # written a different fresh/resumed ID while we were blocked
+            # in claude --resume — we must not clobber it.
+            new_id = str(result.get("session_id") or session_id)
+            if not save_session(new_id, expected_prior=prior_session_id):
+                print(
+                    "[claude-opinion] Concurrent invocation already updated session "
+                    "state; not overwriting. Next call will use theirs.",
+                    file=sys.stderr,
+                )
             return result["result"]
 
         else:
@@ -501,11 +526,11 @@ def run_claude(stdin_content, instruction):
     new_session_id = result.get("session_id")
     if new_session_id:
         # Compare-and-save: refuse to overwrite if a concurrent invocation
-        # has already written a different fresh session_id.
+        # has already written a different session_id.
         if not save_session(str(new_session_id), expected_prior=prior_session_id):
             print(
-                "[claude-opinion] Concurrent invocation already persisted a different "
-                "fresh session; not overwriting state. The next call will resume theirs.",
+                "[claude-opinion] Concurrent invocation already updated session "
+                "state; not overwriting. Next call will use theirs.",
                 file=sys.stderr,
             )
     else:
