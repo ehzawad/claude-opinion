@@ -14,6 +14,9 @@ possibly-empty balance. See anthropics/claude-code#2051.
 
 An optional positional argument overrides DEFAULT_INSTRUCTION. Pass
 --no-default-instruction to skip the system-prompt directive entirely.
+By default, a short safety line ("Do not modify files...") is appended
+to whatever instruction is active; pass --allow-edit to opt out (only
+do this if you want Claude to make changes).
 
 Set CLAUDE_OPINION_SESSION_KEY in the environment to isolate a
 session's Claude thread from the project-wide thread.
@@ -22,6 +25,7 @@ Usage:
     echo "<context>" | python3 ask_claude.py
     echo "<context>" | python3 ask_claude.py "Custom instruction"
     echo "<context>" | python3 ask_claude.py --no-default-instruction
+    echo "<context>" | python3 ask_claude.py --allow-edit "fix the bug"
 """
 
 import contextlib
@@ -31,11 +35,17 @@ import json
 import os
 import re
 import shutil
+import signal
 import subprocess
 import sys
 import tempfile
 import time
 from functools import cache
+
+# Sentinel for save_session's optional generation check. distinct from None
+# so callers can pass `expected_prior=None` to mean "expect empty state"
+# without colliding with "skip the check entirely".
+_UNCHECKED = object()
 
 STATE_DIR = os.path.join(
     os.environ.get("XDG_STATE_HOME") or os.path.expanduser("~/.local/state"),
@@ -46,16 +56,27 @@ DEFAULT_INSTRUCTION = (
     "Give a thorough second opinion on the context below. "
     "Surface wrong, missing, or incomplete assumptions, trade-offs, and risks. "
     "Prioritize actionable findings; if nothing material stands out, say so clearly. "
-    "Thoroughness beats speed. "
-    "Do not modify files or run mutating commands; provide analysis only."
+    "Thoroughness beats speed."
 )
 
+# Always appended to the active instruction unless --allow-edit is passed.
+# The script invokes claude with --dangerously-skip-permissions, so this is
+# the only thing keeping benign custom instructions ("focus on test
+# coverage", etc.) from accidentally inviting mutating runs.
+SAFETY_DIRECTIVE = "Do not modify files or run mutating commands; provide analysis only."
+
 NO_DEFAULT_FLAG = "--no-default-instruction"
+ALLOW_EDIT_FLAG = "--allow-edit"
 
 # Default subprocess timeout. Long enough for `claude -p --effort max` work
 # (file reads, web fetches, tool calls) without leaving the script wedged
 # forever if the child hangs. Override via CLAUDE_OPINION_TIMEOUT env var.
 _DEFAULT_TIMEOUT_SECONDS = 600
+
+# Bound on the one-shot `claude --help` probe. Help should return instantly;
+# 10s is generous and prevents the script from hanging before the protected
+# `claude -p` call ever runs.
+_HELP_TIMEOUT_SECONDS = 10
 
 # Env vars that route away from the Claude.ai subscription. Stripped
 # before every claude -p spawn so subscription auth wins over API-key
@@ -146,8 +167,34 @@ def _state_lock():
         os.close(fd)
 
 
-def save_session(session_id):
+def save_session(session_id, expected_prior=_UNCHECKED):
+    """Persist session metadata atomically; optionally guard against races.
+
+    When `expected_prior` is left as `_UNCHECKED` (the default), the save is
+    unconditional — last writer wins. This is the right behavior on the
+    resume-success path, where both racers would be writing the same alive
+    session ID anyway.
+
+    When `expected_prior` is provided (including `None`), the save is a
+    compare-and-save: it only writes if the current state's `session_id`
+    matches `expected_prior` *or* there is no state file. This closes the
+    fresh-save race where two parallel invocations would otherwise both
+    overwrite each other's freshly-allocated session IDs.
+
+    Returns True if the write happened, False if it was skipped because a
+    concurrent invocation already wrote a different session_id.
+    """
     with _state_lock():
+        if expected_prior is not _UNCHECKED:
+            try:
+                with open(_state_path()) as f:
+                    current = json.load(f).get("session_id")
+            except (OSError, json.JSONDecodeError):
+                current = None
+            # `current is None` means empty/unreadable state — treat as
+            # "no concurrent writer" and proceed. Otherwise it must match.
+            if current is not None and current != expected_prior:
+                return False
         meta = {
             "session_id": session_id,
             "project_path": _project_root(),
@@ -168,6 +215,7 @@ def save_session(session_id):
             except OSError:
                 pass
             raise
+        return True
 
 
 def clear_session(expected_session_id=None):
@@ -205,8 +253,9 @@ def _claude_help_text():
         proc = subprocess.run(
             ["claude", "--help"],
             capture_output=True, text=True, env=_subprocess_env(),
+            timeout=_HELP_TIMEOUT_SECONDS,
         )
-    except OSError:
+    except (OSError, subprocess.TimeoutExpired):
         return ""
     return "\n".join(part for part in (proc.stdout, proc.stderr) if part)
 
@@ -262,19 +311,52 @@ def _subprocess_timeout():
 
 
 def _run_claude_proc(cmd, prompt):
+    """Run `claude -p` with a process-group-bounded timeout.
+
+    `start_new_session=True` puts claude in its own process group so a
+    timeout can SIGKILL the whole tree (claude itself plus any tool
+    subprocesses it spawned during -p execution); plain `subprocess.run`
+    timeouts only signal the direct child.
+    """
     timeout = _subprocess_timeout()
+    proc = subprocess.Popen(
+        cmd,
+        stdin=subprocess.PIPE,
+        stdout=subprocess.PIPE,
+        stderr=subprocess.PIPE,
+        text=True,
+        env=_subprocess_env(),
+        start_new_session=True,
+    )
     try:
-        return subprocess.run(
-            cmd, input=prompt, capture_output=True, text=True,
-            env=_subprocess_env(), timeout=timeout,
-        )
+        stdout, stderr = proc.communicate(input=prompt, timeout=timeout)
     except subprocess.TimeoutExpired:
+        try:
+            os.killpg(proc.pid, signal.SIGKILL)
+        except (ProcessLookupError, PermissionError):
+            pass
+        try:
+            proc.communicate(timeout=5)
+        except subprocess.TimeoutExpired:
+            try:
+                proc.kill()
+            except OSError:
+                pass
+            try:
+                proc.communicate(timeout=2)
+            except subprocess.TimeoutExpired:
+                pass
         print(
             f"[claude-opinion] claude -p exceeded {timeout}s timeout. "
             "Raise CLAUDE_OPINION_TIMEOUT or check whether claude itself is hung.",
             file=sys.stderr,
         )
         sys.exit(1)
+
+    return subprocess.CompletedProcess(
+        args=cmd, returncode=proc.returncode,
+        stdout=stdout, stderr=stderr,
+    )
 
 
 def _base_cmd(project_root, append_system_prompt):
@@ -320,6 +402,10 @@ def _is_stale_resume(result):
 def run_claude(stdin_content, instruction):
     root = _project_root()
     session_id, meta = load_session()
+    # Capture the state generation we observed at entry. Used for the
+    # compare-and-save guard on the fresh path so a parallel invocation
+    # that has already written a different fresh ID isn't clobbered.
+    prior_session_id = session_id
 
     if session_id:
         cmd = _base_cmd(root, instruction) + ["--resume", session_id]
@@ -359,6 +445,8 @@ def run_claude(stdin_content, instruction):
             sys.exit(1)
 
         elif result and result.get("result"):
+            # Resume-success: last-writer-wins is fine here because both
+            # racers would be writing the same alive session ID.
             save_session(str(result.get("session_id") or session_id))
             return result["result"]
 
@@ -410,9 +498,16 @@ def run_claude(stdin_content, instruction):
             print(stderr, file=sys.stderr)
         sys.exit(1)
 
-    session_id = result.get("session_id")
-    if session_id:
-        save_session(str(session_id))
+    new_session_id = result.get("session_id")
+    if new_session_id:
+        # Compare-and-save: refuse to overwrite if a concurrent invocation
+        # has already written a different fresh session_id.
+        if not save_session(str(new_session_id), expected_prior=prior_session_id):
+            print(
+                "[claude-opinion] Concurrent invocation already persisted a different "
+                "fresh session; not overwriting state. The next call will resume theirs.",
+                file=sys.stderr,
+            )
     else:
         # Don't discard the user's answer just because resume isn't possible
         # next time. Surface it as a warning and skip persistence.
@@ -426,18 +521,27 @@ def run_claude(stdin_content, instruction):
 
 def _instruction_from_args(args):
     no_default = False
+    allow_edit = False
     parts = []
     for arg in args:
         if arg == NO_DEFAULT_FLAG:
             no_default = True
+        elif arg == ALLOW_EDIT_FLAG:
+            allow_edit = True
         else:
             parts.append(arg)
     custom = " ".join(parts).strip()
     if custom:
-        return custom
-    if no_default:
+        instruction = custom
+    elif no_default:
+        # Explicit opt-out of any system prompt at all — including the
+        # safety directive. The user is in raw-passthrough mode.
         return ""
-    return DEFAULT_INSTRUCTION
+    else:
+        instruction = DEFAULT_INSTRUCTION
+    if not allow_edit:
+        instruction = f"{instruction} {SAFETY_DIRECTIVE}"
+    return instruction
 
 
 def main():

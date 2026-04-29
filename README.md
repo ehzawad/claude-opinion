@@ -81,9 +81,14 @@ sequenceDiagram
 
 ## Session management
 
-One Claude session per project, stored at `$XDG_STATE_HOME/claude-opinion/{project-hash}.json` (default `~/.local/state/claude-opinion/...`). When a saved session is no longer resumable (Claude reports *"no conversation found with session ID …"*), the script clears the state under an `fcntl` lock (compare-and-clear, so a concurrent invocation that has already written a fresh ID is preserved), logs a notice, and starts fresh. Other resume failures surface as hard errors with Claude's stderr.
+One Claude session per project, stored at `$XDG_STATE_HOME/claude-opinion/{project-hash}.json` (default `~/.local/state/claude-opinion/...`). State writes are serialized by an `fcntl` lock and use generation-aware reads:
+
+- **Stale-session clearing** is compare-and-clear: the file is only removed if its current `session_id` still matches the one we tried to resume, so a parallel invocation that has already written a fresh ID is preserved.
+- **Fresh-call save** is compare-and-save: the new session_id only overwrites state if the current state still matches what we observed at entry (or the file is empty). If a parallel invocation has already persisted a different fresh ID since we started, our save is skipped with a stderr warning, and the next call resumes their session.
 
 If a successful call returns a result but no `session_id`, the script prints a warning, returns the answer, and skips the session save — next call starts fresh rather than discarding the user's answer.
+
+Other resume failures surface as hard errors with Claude's stderr.
 
 Set `CLAUDE_OPINION_SESSION_KEY` before launching Codex to scope state to that session — the state file becomes `{project-hash}-{session-hash}.json` and the session gets its own Claude thread.
 
@@ -91,13 +96,13 @@ See [DESIGN.md](DESIGN.md) for the session-management flowchart and JSON protoco
 
 ## Security
 
-Claude runs with `--dangerously-skip-permissions` — no approval prompts. This gives Claude full read/write access to your machine so it can thoroughly inspect and analyze the current project. The default system-prompt directive instructs Claude to provide analysis only and not modify files. Custom instructions (positional arg) override that directive, so if you replace it with something like *"review and fix"* you opt back into mutating runs. Do not use this skill on untrusted projects or with untrusted input.
+Claude runs with `--dangerously-skip-permissions` — no approval prompts. This gives Claude full read/write access to your machine so it can thoroughly inspect and analyze the current project. A short safety directive (*"do not modify files or run mutating commands; provide analysis only"*) is appended to whatever instruction is active — built-in *and* user-supplied — so a benign custom instruction like *"focus on test coverage"* still runs analysis-only by default. Pass `--allow-edit` to opt out (only do this if you genuinely want Claude to edit files, e.g. *"review and fix the migration"*); `--no-default-instruction` skips everything for raw passthrough. Do not use this skill on untrusted projects or with untrusted input.
 
 ## Configuration
 
 The script uses your Claude Code default model and other non-overridden settings. It explicitly selects the highest effort level advertised by the installed Claude CLI: `max` when available, otherwise the next highest known level (`xhigh`, `high`, `medium`, `low`). If the CLI has no `--effort` support, the flag is omitted. No model is hardcoded. Permission bypass is overridden by the skill (see Security above).
 
-The subprocess is bounded by `CLAUDE_OPINION_TIMEOUT` (env var, default `600` seconds). Set a larger value if you regularly run very long opinions; non-numeric or non-positive values fall back to the default rather than disabling the timeout. On timeout the script kills the child, prints a clear stderr message, and exits non-zero so the parent agent can react.
+The `claude -p` subprocess is bounded by `CLAUDE_OPINION_TIMEOUT` (env var, default `600` seconds), and it runs in its own process group so a timeout kills the whole tree (claude itself plus any tool subprocesses it spawned during execution) — `subprocess.run`'s built-in timeout signals only the direct child. Set a larger value if you regularly run very long opinions; non-numeric or non-positive values fall back to the default rather than disabling the timeout. The one-shot `claude --help` probe used to detect supported `--effort` levels is bounded separately at 10 seconds so a hung help call can't wedge the script before the protected `claude -p` call ever runs.
 
 ## Subprocess auth routing
 

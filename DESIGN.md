@@ -4,7 +4,14 @@ Implementation details for contributors and maintainers. User-facing docs live i
 
 ## Protocol vs transport boundary
 
-The skill layer (how to call Claude, how to build context, session continuity) lives in [`SKILL.md`](SKILL.md); runtime reconciliation is Codex's judgment. [`scripts/ask_claude.py`](scripts/ask_claude.py) is a transport shim: it appends a short default review directive (analysis-only) to Claude's system prompt, calls `claude -p --output-format json` with the highest supported `--effort` level, bounds the subprocess by `CLAUDE_OPINION_TIMEOUT` (default 600s), parses the outer JSON, and saves per-project session state from Claude's returned `session_id` under an `fcntl` lock. Stale-session clearing is a compare-and-clear: the file is only removed if its current `session_id` still matches the one we tried to resume, so a parallel invocation that already wrote a fresh ID isn't clobbered. Pass `--no-default-instruction` to skip the system-prompt directive (and the read-only constraint with it).
+The skill layer (how to call Claude, how to build context, session continuity) lives in [`SKILL.md`](SKILL.md); runtime reconciliation is Codex's judgment. [`scripts/ask_claude.py`](scripts/ask_claude.py) is a transport shim: it appends a short default review directive plus an invariant safety directive (analysis-only) to Claude's system prompt, calls `claude -p --output-format json` with the highest supported `--effort` level inside its own process group (`start_new_session=True` so a `CLAUDE_OPINION_TIMEOUT` overrun can `killpg` the whole tree, not just the direct child), parses the outer JSON, and saves per-project session state under an `fcntl` lock. The auxiliary `claude --help` probe is bounded separately at 10 seconds.
+
+Two generation-aware writes close the parallel-invocation races:
+
+- **Stale-resume clearing** is compare-and-clear: the state file is only removed if its current `session_id` still matches the one we tried to resume.
+- **Fresh-call saving** is compare-and-save: the new `session_id` only overwrites state if the file is empty or still holds the value we observed at entry. If a parallel invocation has already persisted a different fresh ID, our save is skipped with a stderr warning rather than clobbering theirs. The resume-success path uses an unconditional save because both racers would be writing the same alive session ID.
+
+Pass `--allow-edit` to drop the safety directive (only meaningful when you actually want Claude to modify files); `--no-default-instruction` skips both the review directive and the safety directive for raw stdin passthrough.
 
 If Claude returns a result but no `session_id`, the script warns and still returns the result — the user's answer isn't worth discarding just because resume isn't possible next time. Save is skipped; the next call starts a fresh session.
 

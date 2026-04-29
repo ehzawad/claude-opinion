@@ -126,6 +126,92 @@ class StateFileRoundtripTests(unittest.TestCase):
                 self.assertEqual(sid, "yyy")
 
 
+class CompareAndSaveTests(unittest.TestCase):
+    """Generation-aware save_session — closes the fresh-save race where two
+    parallel invocations would otherwise overwrite each other's fresh IDs."""
+
+    def _ctx(self, td):
+        return [
+            patch.object(ask_claude, "STATE_DIR", td),
+            patch.object(ask_claude, "_project_key", return_value="abc"),
+            patch.object(ask_claude, "_project_root", return_value="/p"),
+            patch.dict(os.environ, _env_without("CLAUDE_OPINION_SESSION_KEY"), clear=True),
+        ]
+
+    def test_unconditional_save_overwrites(self):
+        with tempfile.TemporaryDirectory() as td:
+            with patch.object(ask_claude, "STATE_DIR", td), \
+                 patch.object(ask_claude, "_project_key", return_value="abc"), \
+                 patch.object(ask_claude, "_project_root", return_value="/p"), \
+                 patch.dict(os.environ, _env_without("CLAUDE_OPINION_SESSION_KEY"), clear=True):
+                self.assertTrue(ask_claude.save_session("first"))
+                self.assertTrue(ask_claude.save_session("second"))
+                sid, _ = ask_claude.load_session()
+                self.assertEqual(sid, "second")
+
+    def test_save_with_matching_prior_succeeds(self):
+        with tempfile.TemporaryDirectory() as td:
+            with patch.object(ask_claude, "STATE_DIR", td), \
+                 patch.object(ask_claude, "_project_key", return_value="abc"), \
+                 patch.object(ask_claude, "_project_root", return_value="/p"), \
+                 patch.dict(os.environ, _env_without("CLAUDE_OPINION_SESSION_KEY"), clear=True):
+                ask_claude.save_session("old")
+                wrote = ask_claude.save_session("new", expected_prior="old")
+                self.assertTrue(wrote)
+                sid, _ = ask_claude.load_session()
+                self.assertEqual(sid, "new")
+
+    def test_save_with_mismatched_prior_refuses(self):
+        with tempfile.TemporaryDirectory() as td:
+            with patch.object(ask_claude, "STATE_DIR", td), \
+                 patch.object(ask_claude, "_project_key", return_value="abc"), \
+                 patch.object(ask_claude, "_project_root", return_value="/p"), \
+                 patch.dict(os.environ, _env_without("CLAUDE_OPINION_SESSION_KEY"), clear=True):
+                ask_claude.save_session("recent-other")  # concurrent winner
+                wrote = ask_claude.save_session("mine", expected_prior="old")
+                self.assertFalse(wrote)
+                sid, _ = ask_claude.load_session()
+                self.assertEqual(sid, "recent-other")  # not clobbered
+
+    def test_save_with_empty_state_and_any_prior_succeeds(self):
+        # Empty state means "no concurrent writer", regardless of what we
+        # observed at entry.
+        with tempfile.TemporaryDirectory() as td:
+            with patch.object(ask_claude, "STATE_DIR", td), \
+                 patch.object(ask_claude, "_project_key", return_value="abc"), \
+                 patch.object(ask_claude, "_project_root", return_value="/p"), \
+                 patch.dict(os.environ, _env_without("CLAUDE_OPINION_SESSION_KEY"), clear=True):
+                wrote = ask_claude.save_session("mine", expected_prior="anything")
+                self.assertTrue(wrote)
+                sid, _ = ask_claude.load_session()
+                self.assertEqual(sid, "mine")
+
+    def test_save_with_none_prior_and_empty_state_succeeds(self):
+        # No prior observed AND no state → first writer wins
+        with tempfile.TemporaryDirectory() as td:
+            with patch.object(ask_claude, "STATE_DIR", td), \
+                 patch.object(ask_claude, "_project_key", return_value="abc"), \
+                 patch.object(ask_claude, "_project_root", return_value="/p"), \
+                 patch.dict(os.environ, _env_without("CLAUDE_OPINION_SESSION_KEY"), clear=True):
+                wrote = ask_claude.save_session("mine", expected_prior=None)
+                self.assertTrue(wrote)
+                sid, _ = ask_claude.load_session()
+                self.assertEqual(sid, "mine")
+
+    def test_save_with_none_prior_and_other_state_refuses(self):
+        # We saw nothing at entry but someone else has written → refuse
+        with tempfile.TemporaryDirectory() as td:
+            with patch.object(ask_claude, "STATE_DIR", td), \
+                 patch.object(ask_claude, "_project_key", return_value="abc"), \
+                 patch.object(ask_claude, "_project_root", return_value="/p"), \
+                 patch.dict(os.environ, _env_without("CLAUDE_OPINION_SESSION_KEY"), clear=True):
+                ask_claude.save_session("recent-other")
+                wrote = ask_claude.save_session("mine", expected_prior=None)
+                self.assertFalse(wrote)
+                sid, _ = ask_claude.load_session()
+                self.assertEqual(sid, "recent-other")
+
+
 class SubprocessEnvTests(unittest.TestCase):
     def test_strips_api_key(self):
         with patch.dict(os.environ, {"ANTHROPIC_API_KEY": "secret", "FOO": "bar"}, clear=True):
@@ -167,34 +253,52 @@ class SubprocessEnvTests(unittest.TestCase):
 
 
 class InstructionCompositionTests(unittest.TestCase):
-    def test_no_args_returns_default(self):
-        self.assertEqual(
-            ask_claude._instruction_from_args([]),
-            ask_claude.DEFAULT_INSTRUCTION,
-        )
+    def test_no_args_returns_default_plus_safety(self):
+        result = ask_claude._instruction_from_args([])
+        self.assertIn(ask_claude.DEFAULT_INSTRUCTION, result)
+        self.assertIn(ask_claude.SAFETY_DIRECTIVE, result)
 
-    def test_custom_instruction_overrides_default(self):
-        self.assertEqual(
-            ask_claude._instruction_from_args(["review", "the", "diff"]),
-            "review the diff",
-        )
+    def test_custom_instruction_keeps_custom_plus_safety(self):
+        result = ask_claude._instruction_from_args(["review", "the", "diff"])
+        self.assertIn("review the diff", result)
+        self.assertIn(ask_claude.SAFETY_DIRECTIVE, result)
 
     def test_no_default_flag_returns_empty(self):
+        # Explicit opt-out of any system prompt — including safety
         self.assertEqual(
             ask_claude._instruction_from_args([ask_claude.NO_DEFAULT_FLAG]),
             "",
         )
 
-    def test_no_default_with_custom_keeps_custom(self):
-        self.assertEqual(
-            ask_claude._instruction_from_args([ask_claude.NO_DEFAULT_FLAG, "override"]),
-            "override",
-        )
+    def test_no_default_with_custom_appends_safety(self):
+        # --no-default-instruction is moot when a custom instruction is
+        # provided; safety still applies because the user didn't ask for
+        # raw passthrough.
+        result = ask_claude._instruction_from_args([ask_claude.NO_DEFAULT_FLAG, "override"])
+        self.assertIn("override", result)
+        self.assertIn(ask_claude.SAFETY_DIRECTIVE, result)
 
-    def test_default_carries_read_only_directive(self):
-        # The skill is "second opinion" and runs with --dangerously-skip-permissions,
-        # so the default instruction tells Claude not to modify files.
-        lowered = ask_claude.DEFAULT_INSTRUCTION.lower()
+    def test_allow_edit_strips_safety_from_default(self):
+        result = ask_claude._instruction_from_args([ask_claude.ALLOW_EDIT_FLAG])
+        self.assertEqual(result, ask_claude.DEFAULT_INSTRUCTION)
+        self.assertNotIn(ask_claude.SAFETY_DIRECTIVE, result)
+
+    def test_allow_edit_strips_safety_from_custom(self):
+        result = ask_claude._instruction_from_args([
+            ask_claude.ALLOW_EDIT_FLAG, "review", "and", "fix",
+        ])
+        self.assertEqual(result, "review and fix")
+        self.assertNotIn(ask_claude.SAFETY_DIRECTIVE, result)
+
+    def test_allow_edit_with_no_default_returns_empty(self):
+        # Both opt-outs together → fully raw passthrough
+        result = ask_claude._instruction_from_args([
+            ask_claude.NO_DEFAULT_FLAG, ask_claude.ALLOW_EDIT_FLAG,
+        ])
+        self.assertEqual(result, "")
+
+    def test_safety_directive_actually_says_no_modify(self):
+        lowered = ask_claude.SAFETY_DIRECTIVE.lower()
         self.assertIn("not modify files", lowered)
         self.assertIn("analysis only", lowered)
 
@@ -217,17 +321,44 @@ class SubprocessTimeoutTests(unittest.TestCase):
             with patch.dict(os.environ, {"CLAUDE_OPINION_TIMEOUT": value}, clear=True):
                 self.assertEqual(ask_claude._subprocess_timeout(), ask_claude._DEFAULT_TIMEOUT_SECONDS)
 
-    def test_run_claude_proc_exits_when_subprocess_times_out(self):
-        # Mocking subprocess.run on the module so the timeout path runs end-to-end
-        timeout_exc = subprocess.TimeoutExpired(cmd=["claude"], timeout=1)
+    def test_run_claude_proc_kills_process_group_on_timeout(self):
+        # Popen + start_new_session=True + os.killpg → bounded process tree.
+        import signal as _signal
+
+        fake_proc = MagicMock()
+        fake_proc.pid = 99999
+        fake_proc.returncode = -9
+        # First communicate (with input) raises; second (drain after kill)
+        # returns cleanly.
+        fake_proc.communicate.side_effect = [
+            subprocess.TimeoutExpired(cmd=["claude"], timeout=1),
+            ("", ""),
+        ]
+
+        killpg_calls = []
         stderr = io.StringIO()
-        with patch("ask_claude.subprocess.run", side_effect=timeout_exc), \
+        with patch("ask_claude.subprocess.Popen", return_value=fake_proc), \
+             patch("ask_claude.os.killpg", side_effect=lambda pid, sig: killpg_calls.append((pid, sig))), \
              patch.dict(os.environ, {"CLAUDE_OPINION_TIMEOUT": "1"}, clear=True), \
              patch("sys.stderr", stderr):
             with self.assertRaises(SystemExit) as cm:
                 ask_claude._run_claude_proc(["claude", "-p"], "ctx")
         self.assertEqual(cm.exception.code, 1)
         self.assertIn("timeout", stderr.getvalue().lower())
+        self.assertEqual(killpg_calls, [(99999, _signal.SIGKILL)])
+
+    def test_claude_help_text_returns_empty_on_timeout(self):
+        # `claude --help` must not be allowed to wedge the script before the
+        # protected `claude -p` invocation.
+        ask_claude._claude_help_text.cache_clear()
+        try:
+            with patch("ask_claude.subprocess.run",
+                       side_effect=subprocess.TimeoutExpired(
+                           cmd=["claude", "--help"], timeout=10,
+                       )):
+                self.assertEqual(ask_claude._claude_help_text(), "")
+        finally:
+            ask_claude._claude_help_text.cache_clear()
 
 
 class EffortSelectionTests(unittest.TestCase):
@@ -420,6 +551,34 @@ class RunClaudeFreshPathTests(unittest.TestCase):
                 with self.assertRaises(SystemExit) as cm:
                     ask_claude.run_claude("ctx", "directive")
                 self.assertEqual(cm.exception.code, 1)
+
+    def test_fresh_save_refuses_to_clobber_concurrent_writer(self):
+        # Simulate a concurrent invocation: while our claude -p is running,
+        # another process writes a different fresh session_id. We should
+        # return our text but NOT overwrite the state.
+        fake_stdout = json.dumps({
+            "result": "mine", "is_error": False, "session_id": "fresh-mine",
+        })
+        fake_proc = self._fake_proc(fake_stdout)
+
+        def side_effect_with_concurrent_write(*args, **kwargs):
+            ask_claude.save_session("fresh-other")
+            return fake_proc
+
+        stderr = io.StringIO()
+        with tempfile.TemporaryDirectory() as td:
+            with patch.object(ask_claude, "STATE_DIR", td), \
+                 patch.object(ask_claude, "_project_key", return_value="abc"), \
+                 patch.object(ask_claude, "_project_root", return_value="/p"), \
+                 patch.object(ask_claude, "_run_claude_proc",
+                              side_effect=side_effect_with_concurrent_write), \
+                 patch.dict(os.environ, _env_without("CLAUDE_OPINION_SESSION_KEY"), clear=True), \
+                 patch("sys.stderr", stderr):
+                text = ask_claude.run_claude("ctx", "directive")
+                self.assertEqual(text, "mine")
+                sid, _ = ask_claude.load_session()
+                self.assertEqual(sid, "fresh-other")  # not clobbered
+        self.assertIn("Concurrent invocation", stderr.getvalue())
 
 
 class RunClaudeResumeStaleFallbackTests(unittest.TestCase):

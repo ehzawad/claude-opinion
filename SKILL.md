@@ -12,7 +12,7 @@ Prefer `max` when Claude advertises explicit effort levels; treat `auto` as a fa
 
 Call with your context on stdin and **wait for the script to exit synchronously**. Codex CLI does not have a "fire and forget + notify on completion" shell mechanism (unlike Claude Code's `Bash run_in_background`); just run the call and let it block. A Claude call with `--effort max` and full file access often takes 1–5 minutes, occasionally longer. The script enforces its own subprocess timeout (`CLAUDE_OPINION_TIMEOUT` env var, default 600s) so it cannot wedge forever — but if Codex's outer per-command timeout is shorter than that, the work will be killed mid-flight. If your Codex environment caps shell commands aggressively, raise that cap before invoking this skill.
 
-The script spawns `claude` with `--dangerously-skip-permissions` — Claude can read and write files during the opinion, so don't use this skill on untrusted projects. The default system-prompt directive instructs Claude to provide analysis only and not modify files. Custom instructions override that directive — when you pass one, restate the read-only constraint if you want it preserved.
+The script spawns `claude` with `--dangerously-skip-permissions` — Claude can read and write files during the opinion, so don't use this skill on untrusted projects. A safety directive (*"do not modify files; provide analysis only"*) is appended to whatever instruction is active by default — both the built-in one and any custom positional instruction. Pass `--allow-edit` only when you actually want Claude to modify files (e.g. *"review and fix the migration"*).
 
 To update the installed skill itself, run `python3 ~/.agents/skills/claude-opinion/scripts/update_skill.py`.
 
@@ -20,7 +20,7 @@ To update the installed skill itself, run `python3 ~/.agents/skills/claude-opini
 echo "<gathered context>" | python3 ~/.agents/skills/claude-opinion/scripts/ask_claude.py
 ```
 
-The script appends a default review directive to Claude's system prompt. Pass a positional arg to override it, or `--no-default-instruction` to skip the directive.
+The script appends a default review directive plus the safety directive. Pass a positional arg to replace the review directive, `--allow-edit` to drop the safety directive, or `--no-default-instruction` to skip everything (raw stdin passthrough).
 
 ## Building the context
 
