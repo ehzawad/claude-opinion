@@ -84,9 +84,12 @@ sequenceDiagram
 One Claude session per project, stored at `$XDG_STATE_HOME/claude-opinion/{project-hash}.json` (default `~/.local/state/claude-opinion/...`). State writes are serialized by an `fcntl` lock and use generation-aware reads:
 
 - **Stale-session clearing** is compare-and-clear: the file is only removed if its current `session_id` still matches the one we tried to resume, so a parallel invocation that has already written a fresh ID is preserved.
-- **Fresh-call save** is compare-and-save: the new session_id only overwrites state if the current state still matches what we observed at entry (or the file is empty). If a parallel invocation has already persisted a different fresh ID since we started, our save is skipped with a stderr warning, and the next call resumes their session.
+- **Fresh-call save** is compare-and-save: the new session_id only overwrites state if the current state still matches what we observed at entry (or the file is empty). If a parallel invocation has already persisted a different ID since we started, our save is skipped with a stderr warning, and the next call resumes theirs.
+- **Resume-success save** uses the same compare-and-save guard. Claude can rotate the session ID on `--resume`, and a sibling invocation may write a different fresh/resumed ID while we're blocked in `claude --resume <old>`; saving unconditionally would clobber it.
 
 If a successful call returns a result but no `session_id`, the script prints a warning, returns the answer, and skips the session save — next call starts fresh rather than discarding the user's answer.
+
+If the state file becomes corrupt (e.g. JSON garbled by an external writer or another tool's crash), the next call quarantines it under `{project-hash}.json.corrupt.{timestamp}` and warns with the full path. The follow-up save persists a fresh session_id normally — the corrupt file is preserved for inspection rather than silently overwritten or trapped in a fresh-then-refuse-save loop.
 
 Other resume failures surface as hard errors with Claude's stderr.
 

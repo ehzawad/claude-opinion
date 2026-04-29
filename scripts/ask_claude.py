@@ -133,14 +133,43 @@ def _state_path():
 
 
 def load_session():
+    """Load session metadata, or quarantine and return None on corruption.
+
+    A corrupt state file (e.g. JSON garbled by an external writer or a
+    crash in another tool) would otherwise wedge every subsequent call
+    into a fresh-then-refuse-save loop: load_session returns None silently,
+    a fresh `claude -p` runs successfully, then save_session refuses to
+    overwrite the unreadable file. We break that doom loop here by renaming
+    the corrupt file aside (preserving evidence for inspection) so the
+    follow-up save can persist a new session_id normally. Plain I/O errors
+    (permissions, etc.) stay silent — they're outside our recovery scope.
+    """
+    state_path = _state_path()
     try:
-        with open(_state_path()) as f:
+        with open(state_path) as f:
             meta = json.load(f)
             sid = meta.get("session_id")
             if sid:
                 return sid, meta
-    except (OSError, json.JSONDecodeError):
+    except FileNotFoundError:
         pass
+    except OSError:
+        pass
+    except json.JSONDecodeError:
+        try:
+            quarantine_path = f"{state_path}.corrupt.{int(time.time())}"
+            os.rename(state_path, quarantine_path)
+            print(
+                f"[claude-opinion] State file at {state_path} was corrupt; "
+                f"moved to {quarantine_path} and starting fresh.",
+                file=sys.stderr,
+            )
+        except OSError as e:
+            print(
+                f"[claude-opinion] State file at {state_path} is corrupt and "
+                f"could not be quarantined ({e}); manual cleanup required.",
+                file=sys.stderr,
+            )
     return None, None
 
 

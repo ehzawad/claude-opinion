@@ -114,6 +114,50 @@ class StateFileRoundtripTests(unittest.TestCase):
                 sid, _ = ask_claude.load_session()
                 self.assertIsNone(sid)
 
+    def test_load_quarantines_corrupt_state(self):
+        # Corrupt state must NOT silently doom-loop subsequent calls;
+        # quarantine the bad file, warn with the full path, return None,
+        # and let the next save persist a fresh session_id normally.
+        with tempfile.TemporaryDirectory() as td:
+            with patch.object(ask_claude, "STATE_DIR", td), \
+                 patch.object(ask_claude, "_project_key", return_value="abc"), \
+                 patch.object(ask_claude, "_project_root", return_value="/p"), \
+                 patch.dict(os.environ, _env_without("CLAUDE_OPINION_SESSION_KEY"), clear=True):
+                state_path = ask_claude._state_path()
+                with open(state_path, "w") as f:
+                    f.write("not valid json {{{")
+                stderr = io.StringIO()
+                with patch("sys.stderr", stderr):
+                    sid, meta = ask_claude.load_session()
+                self.assertIsNone(sid)
+                self.assertIsNone(meta)
+                self.assertFalse(os.path.exists(state_path))
+                quarantined = [n for n in os.listdir(td)
+                               if n.startswith(os.path.basename(state_path) + ".corrupt.")]
+                self.assertEqual(len(quarantined), 1)
+                with open(os.path.join(td, quarantined[0])) as f:
+                    self.assertEqual(f.read(), "not valid json {{{")
+                err = stderr.getvalue()
+                self.assertIn(state_path, err)
+                self.assertIn("corrupt", err.lower())
+
+    def test_load_after_quarantine_then_save_persists_fresh(self):
+        # End-to-end: corrupt state on disk → load returns None & quarantines →
+        # subsequent save with expected_prior=None succeeds (no doom loop).
+        with tempfile.TemporaryDirectory() as td:
+            with patch.object(ask_claude, "STATE_DIR", td), \
+                 patch.object(ask_claude, "_project_key", return_value="abc"), \
+                 patch.object(ask_claude, "_project_root", return_value="/p"), \
+                 patch.dict(os.environ, _env_without("CLAUDE_OPINION_SESSION_KEY"), clear=True), \
+                 patch("sys.stderr", io.StringIO()):
+                with open(ask_claude._state_path(), "w") as f:
+                    f.write("garbage")
+                ask_claude.load_session()  # triggers quarantine
+                wrote = ask_claude.save_session("fresh", expected_prior=None)
+                self.assertTrue(wrote)
+                sid, _ = ask_claude.load_session()
+                self.assertEqual(sid, "fresh")
+
     def test_clear_with_mismatched_expected_keeps(self):
         with tempfile.TemporaryDirectory() as td:
             with patch.object(ask_claude, "STATE_DIR", td), \
