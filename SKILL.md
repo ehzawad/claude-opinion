@@ -1,74 +1,73 @@
 ---
 name: claude-opinion
-description: Second opinion from Claude Code — you, Codex, and Claude in the loop. Invoke $claude-opinion, or naturally via phrases like "ask claude," "second opinion," "another perspective," "claude weigh in," "reconcile with claude."
+description: Persistent single-agent second opinion from Claude Code — Codex and Claude in the same project loop. Invoke $claude-opinion, or naturally via “ask Claude”, “second opinion”, “another perspective”, “Claude weigh in”, or “reconcile with Claude”.
 ---
 
 # Claude Second Opinion
 
-Get a second opinion from Claude Code on your current work. Claude uses your configured model, while the script selects the highest effort level supported by the installed Claude CLI.
-Prefer `max` when Claude advertises explicit effort levels; treat `auto` as a fallback, not the preferred choice.
+Ask one persistent Claude Code agent to review the current work, then reconcile its response with your own assessment.
 
-## How to call
+## Invocation contract
 
-Call with your context on stdin and **wait for the script to exit synchronously**. Codex CLI does not have a "fire and forget + notify on completion" shell mechanism (unlike Claude Code's `Bash run_in_background`); just run the call and let it block. A Claude call with `--effort max` and full file access often takes 1–5 minutes, occasionally longer. The script enforces its own subprocess timeout (`CLAUDE_OPINION_TIMEOUT` env var, default 600s) so it cannot wedge forever — but if Codex's outer per-command timeout is shorter than that, the work will be killed mid-flight. If your Codex environment caps shell commands aggressively, raise that cap before invoking this skill.
-
-The script spawns `claude` with `--dangerously-skip-permissions` — Claude can read and write files during the opinion, so don't use this skill on untrusted projects. A safety directive (*"do not modify files; provide analysis only"*) is appended to whatever instruction is active by default — both the built-in one and any custom positional instruction. Pass `--allow-edit` only when you actually want Claude to modify files (e.g. *"review and fix the migration"*).
-
-To update the installed skill itself, run `python3 ~/.agents/skills/claude-opinion/scripts/update_skill.py`.
+Call the script synchronously and wait for it to exit:
 
 ```bash
-echo "<gathered context>" | python3 ~/.agents/skills/claude-opinion/scripts/ask_claude.py
+printf '%s\n' "<gathered context>" \
+  | python3 ~/.agents/skills/claude-opinion/scripts/ask_claude.py
 ```
 
-The script appends a default review directive plus the safety directive. Pass a positional arg to replace the review directive, `--allow-edit` to drop the safety directive, or `--no-default-instruction` to skip everything (raw stdin passthrough).
+Do not wrap the command in `timeout`, do not set a short outer shell-tool deadline, and do not launch it in the background. The wrapper has no normal wall-clock timeout and is intended to run until Claude completes. An external host may still enforce its own hard limit; use the longest/disabled command timeout available to the host.
 
-## Building the context
+The wrapper also imposes no stdin-size, stdout-size, turn, or budget cap. Do not add `head`, `tail`, byte truncation, token truncation, `--max-turns`, or `--max-budget-usd` around the call merely to make it finish sooner.
 
-If there are uncommitted changes:
+Keep this workflow single-agent: invoke one top-level `ask_claude.py` process for the task. Do not fan out multiple Claude roles, pass `--agent`/`--agents`, or run concurrent copies against the same project/session key. Sequential follow-up turns are allowed when they materially improve the answer.
 
-```bash
-git diff HEAD | python3 ~/.agents/skills/claude-opinion/scripts/ask_claude.py
-```
+## Building context
 
-If there are also untracked files that matter, include them (with binary/size guards):
+When the target is the working-tree change set:
 
 ```bash
-{ git diff HEAD
+{
+  git diff HEAD
   git ls-files --others --exclude-standard | while IFS= read -r f; do
-      file --mime "$f" | grep -q 'charset=binary' && continue
-      [ $(wc -c <"$f") -gt 32768 ] && continue
-      printf '\n=== %s ===\n' "$f"
-      cat "$f"
+    file --mime "$f" | grep -q 'charset=binary' && continue
+    printf '\n=== %s ===\n' "$f"
+    cat "$f"
   done
 } | python3 ~/.agents/skills/claude-opinion/scripts/ask_claude.py
 ```
 
-If `git rev-parse --show-toplevel` fails and the user gave no target, ask the user what to review. Do not pick a nearby repo by recency, parent directory, or any other heuristic.
+There is intentionally no per-file byte guard. Binary untracked files are skipped because stdin is textual, not because of a size quota. When binary evidence matters, describe it and provide a relevant textual inspection instead of dumping arbitrary bytes.
 
-If the repo is clean and the user gave no scope, ask whether they want the staged/unstaged diff, a specific file/path, or a full-codebase opinion. Only auto-gather files when the target is explicit or the diff is non-empty.
+When the repository is clean or the request names a specific target, gather the narrowest complete context implied by the user. Do not enumerate unrelated wrappers, generated directories, or documentation merely to inflate context. If no Git root exists and the user gave no target, ask what should be reviewed rather than guessing a nearby project.
 
-When gathering context yourself with an explicit target, prefer the narrowest slice the user's request implies. Avoid enumerating `bin/`, `README`, and wrappers unless the user asked for a full review.
-
-```bash
-echo "Review this codebase. Key files: ..." | python3 ~/.agents/skills/claude-opinion/scripts/ask_claude.py
-```
-
-With a custom instruction:
+Never pipe an empty string. Supply a concrete prompt when `git diff HEAD` is empty:
 
 ```bash
-echo "<context>" | python3 ~/.agents/skills/claude-opinion/scripts/ask_claude.py "user's instruction"
+printf '%s\n' "Review this codebase. Focus on: ..." \
+  | python3 ~/.agents/skills/claude-opinion/scripts/ask_claude.py
 ```
 
-**Never pipe an empty string.** If `git diff HEAD` would be empty, use echo with gathered context instead.
+Custom instruction:
 
-## Session continuity
+```bash
+printf '%s\n' "<context>" \
+  | python3 ~/.agents/skills/claude-opinion/scripts/ask_claude.py \
+      "Evaluate the design for correctness, failure modes, and migration risk"
+```
 
-One Claude session per project, persisted across Codex sessions. Fresh calls let Claude allocate the session ID, and follow-up calls resume the prior Claude session so it keeps its accumulated codebase knowledge. Reframe when the task shifts so prior framing doesn't bias later turns. If the session has expired, the script logs a notice and starts fresh.
+The default directive requests a thorough second opinion and appends an analysis-only safety rule. Pass `--allow-edit` only when file mutation is explicitly desired. `--no-default-instruction` is raw passthrough.
 
-Set `CLAUDE_OPINION_SESSION_KEY` before launching Codex to isolate a session from the project-wide thread.
+## Session and context continuity
+
+The default is one Claude session per canonical Git worktree/project. Calls from any subdirectory in that project use the same state key, run Claude with the project root as `cwd`, and resume the stored session with `--resume`. The transcript and accumulated project context therefore continue across Codex sessions.
+
+Set `CLAUDE_OPINION_SESSION_KEY` before launching Codex when an independent thread is required within the same project. Calls sharing a project/session key are serialized by a per-thread run lock; do not bypass that ordering with parallel invocations.
+
+If Claude reports that the stored session is stale, the wrapper logs the event, clears only the matching state generation, and starts fresh. Other resume errors are surfaced rather than silently discarding context.
+
+When the task framing changes substantially, state the new framing explicitly so inherited context does not bias the review.
 
 ## After Claude responds
 
-Reconcile Claude's findings with your own read, then tell the user what changed, what you accept, what you challenge, and what remains uncertain.
-
-Multi-turn is available when a reply warrants follow-up (Codex → Claude → Codex → Claude → reconcile); default is single-turn.
+Reconcile rather than relay. Check Claude’s claims against the repository and your own reasoning, then report what you accept, what you reject, what changed your assessment, and what remains uncertain.

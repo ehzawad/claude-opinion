@@ -1,0 +1,32 @@
+name: tests
+
+on:
+  push:
+  pull_request:
+
+permissions:
+  contents: read
+
+jobs:
+  unit:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.11"
+      - name: Run unit tests
+        shell: bash
+        run: |
+          set +e
+          python3 -m unittest discover -s tests -p 'test_*.py' -v > test-output.txt 2>&1
+          status=$?
+          cat test-output.txt
+          exit "$status"
+      - name: Upload unit-test output
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: unit-test-output
+          path: test-output.txt
+          if-no-files-found: error

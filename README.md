@@ -1,26 +1,31 @@
 # claude-opinion
 
-An OpenAI Codex CLI skill that brings Anthropic's Claude Code into your work as a distinct second model. You, Codex, and Claude in the loop. Install once; invoke from any Codex project.
+An OpenAI Codex CLI skill that asks one persistent Claude Code agent for a second opinion. It keeps Codex and Claude in the same project loop without turning the workflow into a panel or fan-out system.
 
-Mirror of [ehzawad/codex-opinion](https://github.com/ehzawad/codex-opinion) (which brings Codex into Claude Code); this reverses the direction.
+This repository mirrors the direction of [`ehzawad/codex-opinion`](https://github.com/ehzawad/codex-opinion): Codex is the host, and Claude Code is the consulted model.
+
+## What this version guarantees
+
+The `scripts/ask_claude.py` entry point deliberately adds no wrapper-level wall-clock timeout, turn limit, budget limit, stdin-size cap, or stdout-size cap. It blocks synchronously until Claude exits or the caller explicitly interrupts it.
+
+Those guarantees apply to this wrapper. The operating system, invoking shell/tool, Claude Code CLI, account, network, and model still have their own intrinsic limits. In particular, an outer Codex command timeout can still terminate a subprocess; the skill instructs Codex not to impose one.
+
+The runtime launches exactly one top-level `claude -p` process. It does not pass `--agent`, `--agents`, `--max-turns`, `--max-budget-usd`, or `--no-session-persistence`, and it does not fan work out internally.
 
 ## Prerequisites
 
-- [OpenAI Codex CLI](https://developers.openai.com/codex/cli) — authenticated (`codex` in terminal)
-- [Claude Code](https://claude.ai/code) — authenticated (`claude auth status` should show logged in)
-
-Both must be logged in and working in your terminal before using this skill.
+- [OpenAI Codex CLI](https://developers.openai.com/codex/cli), authenticated
+- [Claude Code](https://code.claude.com/docs/en/overview), authenticated (`claude auth status`)
+- POSIX-compatible file locking (`fcntl`), so Linux and macOS are supported by this implementation
 
 ## Install
-
-For a first-time install, clone the skill directly into Codex's user-level skills directory:
 
 ```bash
 mkdir -p ~/.agents/skills
 git clone https://github.com/ehzawad/claude-opinion.git ~/.agents/skills/claude-opinion
 ```
 
-This is a user-level install: Codex reads user skills from `$HOME/.agents/skills` and follows symlinked skill folders. If you are developing the skill from a separate checkout, symlink that checkout into the same user-level directory:
+For development from another checkout:
 
 ```bash
 cd /path/to/claude-opinion
@@ -28,94 +33,106 @@ mkdir -p ~/.agents/skills
 ln -s "$(pwd)" ~/.agents/skills/claude-opinion
 ```
 
-Codex usually detects newly installed skills automatically. Restart Codex if `$claude-opinion` does not appear.
+Restart Codex only if `$claude-opinion` is not detected automatically.
 
 ## Update
-
-To update an installed checkout to the latest version:
 
 ```bash
 python3 ~/.agents/skills/claude-opinion/scripts/update_skill.py
 ```
 
-The updater fast-forwards your local checkout from the remote default branch and refuses to run if that checkout has local edits. If you installed the skill by symlinking a development checkout into `~/.agents/skills`, the updater still works, but it updates the underlying source repo rather than the symlink itself.
-
-You can still update manually with git if you prefer:
-
-```bash
-git -C ~/.agents/skills/claude-opinion pull --ff-only
-```
+The updater refuses to overwrite local edits and uses a fast-forward-only pull.
 
 ## Usage
+
+Invoke the skill deterministically:
 
 ```text
 $claude-opinion
 ```
 
-Or naturally via phrases like "ask claude," "second opinion," "another perspective."
+Natural requests such as “ask Claude”, “get a second opinion”, and “reconcile with Claude” can also activate it.
 
-Use `$claude-opinion` for deterministic skill invocation. Codex reserves `/` for built-in slash commands; named skills are invoked via `$`.
+Direct transport usage:
 
-## How it works
-
-The script ships stdin to Claude via `claude -p --output-format json`, sets the highest supported `--effort` level, and adds a short generic review directive on `--append-system-prompt`. Stdin stays as pure context. On the first call per project, the script lets Claude allocate the session ID and persists the returned `session_id` (via compare-and-save — see Session management below). Follow-up calls resume the same session via `--resume <uuid>`, so Claude carries accumulated project knowledge across Codex sessions.
-
-Codex reconciles Claude's response against its own assessment and reports the reconciled output to the user.
-
-```mermaid
-sequenceDiagram
-    participant U as User
-    participant C as Codex CLI
-    participant S as ask_claude.py
-    participant X as Claude Code
-
-    U->>C: $claude-opinion (or natural trigger)
-    C->>C: Compose adaptive context
-    C->>S: Pipe context via stdin
-    S->>X: claude -p --output-format json<br/>(env stripped, highest effort, fresh or resume)
-    X-->>S: {result, is_error, session_id, ...}
-    S->>S: Parse outer JSON, check is_error
-    S-->>C: Claude's analysis via stdout
-    C-->>U: Reconciles and reports
+```bash
+printf '%s\n' "<complete context>" \
+  | python3 ~/.agents/skills/claude-opinion/scripts/ask_claude.py
 ```
 
-## Session management
+Use a custom instruction:
 
-One Claude session per project, stored at `$XDG_STATE_HOME/claude-opinion/{project-hash}.json` (default `~/.local/state/claude-opinion/...`). State writes are serialized by an `fcntl` lock and use generation-aware reads:
+```bash
+printf '%s\n' "<complete context>" \
+  | python3 ~/.agents/skills/claude-opinion/scripts/ask_claude.py \
+      "Review this migration for correctness and operational risk"
+```
 
-- **Stale-session clearing** is compare-and-clear: the file is only removed if its current `session_id` still matches the one we tried to resume, so a parallel invocation that has already written a fresh ID is preserved.
-- **Fresh-call save** is compare-and-save: the new session_id only overwrites state if the current state still matches what we observed at entry (or the file is empty). If a parallel invocation has already persisted a different ID since we started, our save is skipped with a stderr warning, and the next call resumes theirs.
-- **Resume-success save** uses the same compare-and-save guard. Claude can rotate the session ID on `--resume`, and a sibling invocation may write a different fresh/resumed ID while we're blocked in `claude --resume <old>`; saving unconditionally would clobber it.
+Pass `--allow-edit` only when Claude should modify files. Pass `--no-default-instruction` for raw stdin passthrough.
 
-If a successful call returns a result but no `session_id`, the script prints a warning, returns the answer, and skips the session save — next call starts fresh rather than discarding the user's answer.
+## Project-scoped context resume
 
-If the state file becomes corrupt (e.g. JSON garbled by an external writer or another tool's crash), the next call quarantines it under `{project-hash}.json.corrupt.{nanoseconds}.{pid}` and warns with the full path. The follow-up save persists a fresh session_id normally — the corrupt file is preserved for inspection rather than silently overwritten or trapped in a fresh-then-refuse-save loop. The whole load/quarantine sequence runs under the state lock so a sibling save can't slip valid data in between the failed parse and the rename.
+A fresh call lets Claude allocate its session ID. The wrapper stores that ID under:
 
-If the rename itself fails (e.g. directory permissions, read-only FS), the script aborts with an error rather than spending on a `claude -p` call that won't be persistable; remove or fix the state directory and rerun.
+```text
+$XDG_STATE_HOME/claude-opinion/{project-hash}.json
+```
 
-Other resume failures surface as hard errors with Claude's stderr.
+The default state root is `~/.local/state/claude-opinion/`. The key is derived from the canonical Git worktree root; outside Git, it is derived from the canonical current directory. Therefore, calls made from different subdirectories of the same checkout resolve to the same wrapper state.
 
-Set `CLAUDE_OPINION_SESSION_KEY` before launching Codex to scope state to that session — the state file becomes `{project-hash}-{session-hash}.json` and the session gets its own Claude thread.
+The Claude subprocess itself also runs with the canonical project root as `cwd`. That detail is essential: Claude Code associates resumable sessions with project directories/worktrees. Follow-up calls use `--resume <session-id>`, so the Claude transcript and accumulated context continue across separate Codex invocations in the same project.
 
-See [DESIGN.md](DESIGN.md) for the session-management flowchart and JSON protocol diagram.
+Set an explicit key to maintain an independent thread in the same project:
 
-## Security
+```bash
+export CLAUDE_OPINION_SESSION_KEY=architecture-review
+```
 
-Claude runs with `--dangerously-skip-permissions` — no approval prompts. This gives Claude full read/write access to your machine so it can thoroughly inspect and analyze the current project. A short safety directive (*"do not modify files or run mutating commands; provide analysis only"*) is appended to whatever instruction is active — built-in *and* user-supplied — so a benign custom instruction like *"focus on test coverage"* still runs analysis-only by default. Pass `--allow-edit` to opt out (only do this if you genuinely want Claude to edit files, e.g. *"review and fix the migration"*); `--no-default-instruction` skips everything for raw passthrough. Do not use this skill on untrusted projects or with untrusted input.
+This produces `{project-hash}-{session-hash}.json`. Unset it to return to the project-wide default thread.
 
-## Configuration
+## Ordering and concurrency
 
-The script uses your Claude Code default model and other non-overridden settings. It explicitly selects the highest effort level advertised by the installed Claude CLI: `max` when available, otherwise the next highest known level (`xhigh`, `high`, `medium`, `low`). If the CLI has no `--effort` support, the flag is omitted. No model is hardcoded. Permission bypass is overridden by the skill (see Security above).
+The workflow remains single-agent. A per-project/per-session `.run.lock` is held across:
 
-The `claude -p` subprocess is bounded by `CLAUDE_OPINION_TIMEOUT` (env var, default `600` seconds), and it runs in its own process group so a timeout kills the whole tree (claude itself plus any tool subprocesses it spawned during execution) — `subprocess.run`'s built-in timeout signals only the direct child. Set a larger value if you regularly run very long opinions; non-numeric or non-positive values fall back to the default rather than disabling the timeout. The one-shot `claude --help` probe used to detect supported `--effort` levels is bounded separately at 10 seconds so a hung help call can't wedge the script before the protected `claude -p` call ever runs.
+```text
+load session -> resume or start fresh -> receive final result -> save session
+```
 
-## Subprocess auth routing
+That serialization prevents two invocations from writing interleaved messages into the same Claude session. Different projects or explicit session keys can proceed independently.
 
-The script strips `ANTHROPIC_API_KEY`, `ANTHROPIC_AUTH_TOKEN`, and `ANTHROPIC_BASE_URL` from the child `claude` process's environment so Claude.ai subscription auth wins over API-key or proxy-gateway routing (see [anthropics/claude-code#2051](https://github.com/anthropics/claude-code/issues/2051)). Without stripping, a present `ANTHROPIC_API_KEY` routes billing to the API key — which may be a different, possibly-empty balance than the subscription.
+State writes retain the existing atomic replace, corruption quarantine, generation-aware compare-and-save, compare-and-clear, and stale-session fallback behavior. If a stored session no longer exists, the wrapper clears only the matching stale generation and starts a fresh Claude session.
 
-The script also intentionally does not use `--bare`. Current Claude Code CLI help documents that `--bare` disables OAuth and keychain auth reads, so bare mode cannot use a Claude.ai subscription login.
+## Input and output behavior
 
-If you specifically *want* API-key or proxy routing for this skill, set `CLAUDE_OPINION_KEEP_ANTHROPIC_ENV=1` in your environment to skip the strip.
+`stdin` is read in full and sent as the prompt body. Claude’s `result` string is returned in full. The wrapper does not truncate either side and does not apply the previous 32 KiB guard when the skill gathers untracked text files.
+
+This does not make the model context window infinite. For very large repositories, context selection still matters: send the narrowest complete evidence set that supports the requested review, and let Claude inspect the project directly when appropriate.
+
+## Execution and cancellation
+
+`claude --help` capability detection and the main `claude -p` call both run without wrapper timeouts. `CLAUDE_OPINION_TIMEOUT` is no longer consulted by the active entry point.
+
+Pressing Ctrl-C is treated as explicit cancellation. The wrapper terminates Claude’s complete process group so child tool processes do not remain orphaned.
+
+## Security and authentication routing
+
+Claude runs with `--dangerously-skip-permissions`. The default system directive says not to modify files or run mutating commands; `--allow-edit` removes that guard. Do not use the skill on untrusted repositories or prompts.
+
+The child environment strips `ANTHROPIC_API_KEY`, `ANTHROPIC_AUTH_TOKEN`, and `ANTHROPIC_BASE_URL` by default so an authenticated Claude.ai session is not silently displaced by API-key or proxy routing. Set `CLAUDE_OPINION_KEEP_ANTHROPIC_ENV=1` to preserve those variables intentionally.
+
+The wrapper does not use `--bare`, so normal project instructions and Claude Code configuration remain available.
+
+## Implementation note
+
+`scripts/_ask_claude_core.py` preserves the earlier, well-tested transport and session implementation. `scripts/ask_claude.py` is the active policy entry point: it canonicalizes the project root, removes normal timeout enforcement, fixes the child working directory, and adds the per-thread run lock. Do not invoke the internal core file directly.
+
+See [DESIGN.md](DESIGN.md) for the state and launch flow.
+
+## Test
+
+```bash
+python3 -m unittest discover -s tests -p 'test_*.py' -v
+```
 
 ## License
 

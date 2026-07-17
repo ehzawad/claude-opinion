@@ -1,66 +1,138 @@
 # claude-opinion internals
 
-Implementation details for contributors and maintainers. User-facing docs live in [README.md](README.md).
+`claude-opinion` is intentionally a single-agent bridge: Codex composes context, one Claude Code process analyzes it, and Codex reconciles the result. It does not implement the multi-role fan-out, panel, voting, or judge layers used by council-style systems.
 
-## Protocol vs transport boundary
+## Runtime split
 
-The skill layer (how to call Claude, how to build context, session continuity) lives in [`SKILL.md`](SKILL.md); runtime reconciliation is Codex's judgment. [`scripts/ask_claude.py`](scripts/ask_claude.py) is a transport shim: it appends a short default review directive plus an invariant safety directive (analysis-only) to Claude's system prompt, calls `claude -p --output-format json` with the highest supported `--effort` level inside its own process group (`start_new_session=True` so a `CLAUDE_OPINION_TIMEOUT` overrun can `killpg` the whole tree, not just the direct child), parses the outer JSON, and saves per-project session state under an `fcntl` lock. The auxiliary `claude --help` probe is bounded separately at 10 seconds.
+The implementation has two layers:
 
-Three generation-aware writes close the parallel-invocation races:
+- `scripts/_ask_claude_core.py` retains the established JSON transport, authentication routing, session persistence, stale-resume recovery, atomic state writes, and error handling.
+- `scripts/ask_claude.py` is the supported entry point. It replaces execution policy with unbounded blocking, canonical project `cwd`, and a per-project/per-session run lock.
 
-- **Stale-resume clearing** is compare-and-clear: the state file is only removed if its current `session_id` still matches the one we tried to resume.
-- **Fresh-call saving** is compare-and-save: the new `session_id` only overwrites state if the file is missing or still holds the value we observed at entry (or the value we're about to write — a no-op success). If a parallel invocation has already persisted a different ID, our save is skipped with a stderr warning rather than clobbering theirs.
-- **Resume-success saving** uses the same compare-and-save guard. Claude can rotate the session ID on resume, and a sibling invocation may have written a different fresh/resumed ID while we were blocked in `claude --resume <old>` — saving unconditionally would overwrite it.
+The core file is internal and must not be invoked directly.
 
-A corrupt or unreadable existing state file does not collapse to "missing": atomic `os.replace` writes mean this script cannot produce invalid JSON itself, so a corrupt file implies external interference. `save_session` warns and refuses to overwrite rather than masking the problem.
+## No wrapper limits
 
-Pass `--allow-edit` to drop the safety directive (only meaningful when you actually want Claude to modify files); `--no-default-instruction` skips both the review directive and the safety directive for raw stdin passthrough.
+The active entry point calls both `claude --help` and `claude -p` without a `timeout=` argument. The main process uses:
 
-If Claude returns a result but no `session_id`, the script warns and still returns the result — the user's answer isn't worth discarding just because resume isn't possible next time. Save is skipped; the next call starts a fresh session.
-
-The script strips `ANTHROPIC_API_KEY`, `ANTHROPIC_AUTH_TOKEN`, and `ANTHROPIC_BASE_URL` from the child env so Claude.ai subscription auth wins over API-key or proxy-gateway routing ([anthropics/claude-code#2051](https://github.com/anthropics/claude-code/issues/2051)). It also intentionally avoids `--bare`, because current Claude Code builds document that bare mode skips OAuth and keychain auth reads. Set `CLAUDE_OPINION_KEEP_ANTHROPIC_ENV=1` to opt out of the env stripping. When `CLAUDE_OPINION_SESSION_KEY` is set, the state key includes a hash of that value so that caller gets a separate Claude session for the same project.
-
-The script does not interpret Claude's reply semantically, count rounds, or decide when to reconcile. Adding protocol state here would mix transport with judgment; that belongs in the skill.
-
-## Session management flowchart
-
-```mermaid
-flowchart TD
-    A[Invoke $claude-opinion] --> B{Session file exists<br/>for this project?}
-    B -- Yes --> C[claude -p --resume session_id]
-    C --> D{Resume result?}
-    D -- Success + result text --> E[Compare-and-save session metadata<br/>skip on conflict + warn<br/>return response either way]
-    D -- Stale session<br/>'no conversation found' --> F[Log notice + compare-and-clear state]
-    D -- is_error with other message --> X["Surface error + exit 1"]
-    D -- Non-zero exit, no stale marker --> X
-    F --> G[claude -p]
-    B -- No --> G
-    G --> H{Fresh result?}
-    H -- Success + result text<br/>+ session_id --> I[Compare-and-save session metadata<br/>skip on conflict + warn]
-    H -- Success + result text<br/>but no session_id --> J[Warn + skip save]
-    H -- Non-zero exit / malformed JSON<br/>/ is_error / no message --> X
-    I --> E
-    J --> E
+```text
+Popen(..., stdin=PIPE, stdout=PIPE, stderr=PIPE, text=True,
+      cwd=canonical_project_root, start_new_session=True)
+communicate(input=complete_stdin)
 ```
 
-Stale resume can surface either as a non-zero exit with the marker on stderr, or as parsed JSON with `is_error: true` and a matching `errors[]` entry. The transport checks both (`_stale_marker_match` over stderr + `_is_stale_resume` over the parsed result) before any hard-fail branch.
+There is no normal wall-clock timeout, no wrapper turn/budget flag, and no input/output truncation. Completion occurs when Claude exits or the caller explicitly cancels. Ctrl-C kills the process group created by `start_new_session=True`, including Claude-spawned tool subprocesses.
 
-## JSON protocol
+The wrapper cannot remove limits imposed by the host process, operating system, Claude CLI/service, account, network, or model context window.
 
-`ask_claude.py` communicates with `claude -p --output-format json` via a single outer JSON object on stdout:
+## Project identity
+
+Project identity is:
+
+```text
+realpath(git rev-parse --show-toplevel)
+```
+
+Outside Git it falls back to:
+
+```text
+realpath(cwd)
+```
+
+The project key is the first 16 hexadecimal characters of SHA-256 over that canonical path. When `CLAUDE_OPINION_SESSION_KEY` is non-empty, a second 16-character SHA-256 prefix is appended.
+
+```text
+{project-hash}.json
+{project-hash}-{session-hash}.json
+```
+
+The state directory is `$XDG_STATE_HOME/claude-opinion`, defaulting to `~/.local/state/claude-opinion`.
+
+Canonicalizing both the state key and Claude child `cwd` makes calls from sibling subdirectories share the same wrapper state and Claude project namespace. Separate Git worktrees remain separate project roots.
+
+## Single-agent ordering
+
+A `.run.lock` beside the state file is held across the entire logical turn:
+
+```mermaid
+flowchart LR
+    A[Acquire project/session run lock] --> B[Load stored session]
+    B --> C{Session exists?}
+    C -- yes --> D[claude -p --resume session_id]
+    C -- no --> E[claude -p fresh]
+    D --> F{Stale?}
+    F -- yes --> G[Compare-and-clear matching state]
+    G --> E
+    F -- no --> H[Validate final JSON result]
+    E --> H
+    H --> I[Compare-and-save session metadata]
+    I --> J[Release run lock]
+```
+
+This is deliberately serialization, not orchestration. One project/session key has one ordered top-level Claude conversation. Independent projects or explicit session keys use different lock files and can run independently.
+
+The shorter existing state lock still protects individual read/modify/write operations. The run lock prevents two complete calls from resuming the same thread concurrently; the state lock prevents file-level races and corruption.
+
+## Session state
+
+The core persists at least:
+
+```json
+{
+  "session_id": "uuid",
+  "project_path": "/canonical/project/root",
+  "updated_at": "UTC timestamp"
+}
+```
+
+An explicit session key is recorded when present. Writes use a temporary file and atomic `os.replace`. Generation-aware compare-and-save avoids clobbering a session ID written by another process. Stale clearing is compare-and-clear for the same reason.
+
+Malformed state is moved to a collision-resistant `.corrupt.{nanoseconds}.{pid}` path. If quarantine cannot be completed, the call aborts before starting Claude because a successful new session could not be persisted safely.
+
+## Resume protocol
+
+Fresh invocation:
 
 ```mermaid
 sequenceDiagram
-    participant S as ask_claude.py
+    participant C as Codex
+    participant W as ask_claude.py
     participant X as Claude Code
-
-    S->>X: claude -p --output-format json<br/>--effort highest<br/>(stdin = context body)
-    X-->>S: {"result": "...", "is_error": false,<br/>"session_id": "uuid", "total_cost_usd": ..., ...}
-    Note over S: _parse_result extracts outer dict
-    Note over S: Resume path checks stderr + errors[]<br/>for stale markers before hard-fail
-    Note over S: Both paths fail on is_error or missing result
-    Note over S: On clean success, compare-and-save the<br/>returned or resumed session_id;<br/>skip with warning on conflict<br/>or when session_id is missing
-    S-->>S: return result["result"]
+    C->>W: full context on stdin
+    W->>W: canonicalize project + acquire run lock
+    W->>X: claude -p --output-format json (cwd=project root)
+    X-->>W: result + session_id
+    W->>W: persist session metadata
+    W-->>C: complete result text
 ```
 
-`_parse_result` tolerantly parses the single JSON object; on malformed output it returns `None` and the caller hard-fails. If the Claude CLI output format changes (renamed fields, additional envelope), update `_parse_result` and `_is_stale_resume` in [`scripts/ask_claude.py`](scripts/ask_claude.py).
+Follow-up invocation substitutes:
+
+```text
+claude -p --resume <stored-session-id> --output-format json
+```
+
+If Claude reports that the conversation/session no longer exists, the wrapper clears only the matching stale state and retries once as a fresh session. Non-stale errors remain hard failures.
+
+## Command shape
+
+The active command includes one `claude -p`, JSON output, the highest supported explicit effort, `--dangerously-skip-permissions`, `--add-dir <project-root>`, and an optional appended system instruction.
+
+It intentionally omits:
+
+```text
+--agent
+--agents
+--max-turns
+--max-budget-usd
+--no-session-persistence
+--bare
+```
+
+## Verification
+
+```bash
+python3 -m unittest discover -s tests -p 'test_*.py' -v
+```
+
+The policy tests verify that no timeout argument reaches the help probe or `communicate`, the full prompt/result survives transport, the child runs at the canonical project root, forbidden fan-out/limit flags are absent, and run-lock files are private (`0600`). The retained core suite continues to cover state races, corruption recovery, stale resume, command composition, authentication routing, and JSON error paths.
