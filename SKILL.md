@@ -1,28 +1,40 @@
 ---
 name: claude-opinion
-description: Persistent single-agent second opinion from Claude Code — Codex and Claude in the same project loop. Invoke $claude-opinion, or naturally via “ask Claude”, “second opinion”, “another perspective”, “Claude weigh in”, or “reconcile with Claude”.
+description: Persistent Claude second opinion with either a bounded multi-role council or an explicit single-agent path. Invoke $claude-opinion, or naturally via “ask Claude”, “Claude council”, “panel review”, “second opinion”, “another perspective”, or “reconcile with Claude”.
 ---
 
-# Claude Second Opinion
+# Claude Council Opinion
 
-Ask one persistent Claude Code agent to review the current work, then reconcile its response with your own assessment.
+Use a task-specific panel of persistent Claude Code roles, then reconcile their independent reports. The single-agent transport remains available when the user explicitly asks for one Claude perspective.
 
-## Invocation contract
+## Default invocation contract
 
-Call the script synchronously and wait for it to exit:
+For a council review, pipe complete shared context to:
 
 ```bash
 printf '%s\n' "<gathered context>" \
-  | python3 ~/.agents/skills/claude-opinion/scripts/ask_claude.py
+  | python3 ~/.agents/skills/claude-opinion/scripts/claude_council.py \
+      "<task instruction>"
 ```
 
-Do not wrap the command in `timeout`, do not set a short outer shell-tool deadline, and do not launch it in the background. The wrapper has no normal wall-clock timeout and is intended to run until Claude completes. An external host may still enforce its own hard limit; use the longest/disabled command timeout available to the host.
+Run it synchronously. Do not wrap it in `timeout`, apply a short outer shell deadline, truncate stdin/stdout, or launch it in the background. Each role and chair process is intentionally unbounded by this wrapper; the council bounds only concurrent fan-out.
 
-The wrapper also imposes no stdin-size, stdout-size, turn, or budget cap. Do not add `head`, `tail`, byte truncation, token truncation, `--max-turns`, or `--max-budget-usd` around the call merely to make it finish sooner.
+Do not start multiple copies for the same project/session key. The orchestrator already launches the bounded internal panel and holds a council run lock across the complete turn.
 
-Keep this workflow single-agent: invoke one top-level `ask_claude.py` process for the task. Do not fan out multiple Claude roles, pass `--agent`/`--agents`, or run concurrent copies against the same project/session key. Sequential follow-up turns are allowed when they materially improve the answer.
+## Panel selection
 
-## Building context
+Use `--panel auto` unless the task clearly calls for a deterministic panel:
+
+- `--panel minimal` for a small architect/correctness/skeptic review;
+- `--panel engineering` for implementation, reliability, security, and testing;
+- `--panel architecture` for system boundaries, operations, migration, and maintenance;
+- `--panel research` for evidence, methods, reproducibility, and application.
+
+Set `--max-parallel N` when the user requests a smaller or larger concurrency bound. The default is four and the supported range is 1–16.
+
+Use `--roles-file <json>` only when the user supplies a panel or the task needs domain roles not covered by the built-ins. Role IDs must be unique lowercase path-safe identifiers. Each role needs an explicit mandate; avoid redundant personas that would produce correlated reports without adding a distinct lens.
+
+## Building shared context
 
 When the target is the working-tree change set:
 
@@ -34,40 +46,58 @@ When the target is the working-tree change set:
     printf '\n=== %s ===\n' "$f"
     cat "$f"
   done
-} | python3 ~/.agents/skills/claude-opinion/scripts/ask_claude.py
+} | python3 ~/.agents/skills/claude-opinion/scripts/claude_council.py \
+      "Review the current changes"
 ```
 
-There is intentionally no per-file byte guard. Binary untracked files are skipped because stdin is textual, not because of a size quota. When binary evidence matters, describe it and provide a relevant textual inspection instead of dumping arbitrary bytes.
+There is no per-file byte guard. Binary files are skipped because stdin is textual, not because of a quota. When binary evidence matters, provide a textual inspection or let Claude examine the project directly.
 
-When the repository is clean or the request names a specific target, gather the narrowest complete context implied by the user. Do not enumerate unrelated wrappers, generated directories, or documentation merely to inflate context. If no Git root exists and the user gave no target, ask what should be reviewed rather than guessing a nearby project.
+When the repository is clean or the request names a specific target, gather the narrowest complete evidence implied by the user. Do not enumerate unrelated generated directories or wrappers merely to inflate context. Never pipe an empty string.
 
-Never pipe an empty string. Supply a concrete prompt when `git diff HEAD` is empty:
+## Session and role continuity
+
+The council uses one session per canonical project, optional council session key, and role ID. Calls from sibling subdirectories of the same Git worktree use the same state namespace and run Claude from the canonical project root.
+
+Use an independent thread family within the same project with:
 
 ```bash
-printf '%s\n' "Review this codebase. Focus on: ..." \
-  | python3 ~/.agents/skills/claude-opinion/scripts/ask_claude.py
+export CLAUDE_COUNCIL_SESSION_KEY=architecture-review
 ```
 
-Custom instruction:
+If unset, `CLAUDE_OPINION_SESSION_KEY` is used as a fallback. Changing a role's name or mandate invalidates its fingerprint and starts a fresh role thread rather than resuming a different persona under the same ID.
+
+A stale role or chair session is compare-and-cleared and retried once fresh. Other errors are retained as failed role reports rather than aborting the entire panel. If at least one role succeeds, the chair receives both successes and failures.
+
+## Reconciliation path
+
+The script's persistent `council-chair` receives:
+
+1. the original task;
+2. the complete shared context;
+3. the panel manifest;
+4. every role report;
+5. every contained role failure.
+
+The chair must not vote mechanically. It should verify claims, distinguish consensus from proof, resolve contradictions where possible, preserve material dissent, reject weak claims, and prioritize next actions.
+
+After the script returns, Codex remains the final host-side arbiter. Check the chair's claims against the repository and your own reasoning. Report what you accept, what you reject, what changed your assessment, and what remains uncertain; do not merely relay the council report.
+
+## Private run directory
+
+The orchestrator stages `context.md`, `panel.json`, role outputs, and `report.md` in a private `0700` temporary directory with `0600` files. It deletes the directory normally. Use `--keep-run-dir` only when diagnostics or provenance require preserving it, and surface the path to the user.
+
+## Cancellation and failure handling
+
+Ctrl-C terminates all active role or chair process groups. Partial role failures are included in the report. If all roles fail, the script exits non-zero without running the chair. A failed chair also returns the independent reports and exits non-zero.
+
+## Explicit single-agent path
+
+When the user specifically wants one Claude perspective, use:
 
 ```bash
-printf '%s\n' "<context>" \
+printf '%s\n' "<gathered context>" \
   | python3 ~/.agents/skills/claude-opinion/scripts/ask_claude.py \
-      "Evaluate the design for correctness, failure modes, and migration risk"
+      "<task instruction>"
 ```
 
-The default directive requests a thorough second opinion and appends an analysis-only safety rule. Pass `--allow-edit` only when file mutation is explicitly desired. `--no-default-instruction` is raw passthrough.
-
-## Session and context continuity
-
-The default is one Claude session per canonical Git worktree/project. Calls from any subdirectory in that project use the same state key, run Claude with the project root as `cwd`, and resume the stored session with `--resume`. The transcript and accumulated project context therefore continue across Codex sessions.
-
-Set `CLAUDE_OPINION_SESSION_KEY` before launching Codex when an independent thread is required within the same project. Calls sharing a project/session key are serialized by a per-thread run lock; do not bypass that ordering with parallel invocations.
-
-If Claude reports that the stored session is stale, the wrapper logs the event, clears only the matching state generation, and starts fresh. Other resume errors are surfaced rather than silently discarding context.
-
-When the task framing changes substantially, state the new framing explicitly so inherited context does not bias the review.
-
-## After Claude responds
-
-Reconcile rather than relay. Check Claude’s claims against the repository and your own reasoning, then report what you accept, what you reject, what changed your assessment, and what remains uncertain.
+Do not use the single-agent path merely to save effort when the user requested a panel or council.
