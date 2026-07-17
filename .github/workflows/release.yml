@@ -1,0 +1,78 @@
+name: release
+
+on:
+  push:
+    branches:
+      - main
+    paths:
+      - VERSION
+      - .github/release-notes/**
+      - .github/workflows/release.yml
+  workflow_dispatch:
+
+permissions:
+  contents: write
+
+concurrency:
+  group: release-${{ github.repository }}
+  cancel-in-progress: false
+
+jobs:
+  publish:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+
+      - name: Read release metadata
+        id: release
+        shell: bash
+        run: |
+          set -euo pipefail
+
+          version="$(tr -d '[:space:]' < VERSION)"
+          if [[ ! "$version" =~ ^[0-9]+\.[0-9]+\.[0-9]+([-.][0-9A-Za-z.-]+)?$ ]]; then
+            echo "VERSION must contain a semantic version, got: $version" >&2
+            exit 1
+          fi
+
+          tag="v${version}"
+          notes=".github/release-notes/${tag}.md"
+          if [[ ! -s "$notes" ]]; then
+            echo "Missing or empty release notes: $notes" >&2
+            exit 1
+          fi
+
+          title="$(sed -n '1s/^# //p' "$notes")"
+          if [[ -z "$title" ]]; then
+            title="$tag"
+          fi
+
+          {
+            echo "tag=$tag"
+            echo "notes=$notes"
+            echo "title=$title"
+          } >> "$GITHUB_OUTPUT"
+
+      - name: Publish tag and GitHub release
+        shell: bash
+        env:
+          GH_TOKEN: ${{ github.token }}
+          TAG: ${{ steps.release.outputs.tag }}
+          NOTES: ${{ steps.release.outputs.notes }}
+          TITLE: ${{ steps.release.outputs.title }}
+        run: |
+          set -euo pipefail
+
+          if gh release view "$TAG" --repo "$GITHUB_REPOSITORY" >/dev/null 2>&1; then
+            echo "Release $TAG already exists; nothing to do."
+            exit 0
+          fi
+
+          gh release create "$TAG" \
+            --repo "$GITHUB_REPOSITORY" \
+            --target "$GITHUB_SHA" \
+            --title "$TITLE" \
+            --notes-file "$NOTES" \
+            --latest
