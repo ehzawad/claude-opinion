@@ -20,9 +20,28 @@ The runtime launches exactly one top-level `claude -p` process. It does not pass
 
 ## Install
 
+### Stable tagged release
+
+The current stable release is `v0.4.0`:
+
 ```bash
 mkdir -p ~/.agents/skills
-git clone https://github.com/ehzawad/claude-opinion.git ~/.agents/skills/claude-opinion
+git clone --branch v0.4.0 --depth 1 \
+  https://github.com/ehzawad/claude-opinion.git \
+  ~/.agents/skills/claude-opinion
+```
+
+This is the reproducible installation: every user gets the exact code associated with the release tag.
+
+### Rolling main branch
+
+Install directly from the latest `main` branch when you want new merged changes immediately:
+
+```bash
+mkdir -p ~/.agents/skills
+git clone --branch main --single-branch \
+  https://github.com/ehzawad/claude-opinion.git \
+  ~/.agents/skills/claude-opinion
 ```
 
 For development from another checkout:
@@ -37,11 +56,13 @@ Restart Codex only if `$claude-opinion` is not detected automatically.
 
 ## Update
 
+For an installation tracking `main`:
+
 ```bash
 python3 ~/.agents/skills/claude-opinion/scripts/update_skill.py
 ```
 
-The updater refuses to overwrite local edits and uses a fast-forward-only pull.
+The updater refuses to overwrite local edits and uses a fast-forward-only pull from the remote default branch. A checkout pinned to a release tag is intentionally immutable; reinstall the desired tag or switch that checkout to `main` before using the updater.
 
 ## Usage
 
