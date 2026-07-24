@@ -1,8 +1,10 @@
-# claude-opinion
+# claude-opinion 
 
 An OpenAI Codex CLI skill that asks one persistent Claude Code agent for a second opinion. It keeps Codex and Claude in the same project loop without turning the workflow into a panel or fan-out system.
 
 This repository mirrors the direction of [`ehzawad/codex-opinion`](https://github.com/ehzawad/codex-opinion): Codex is the host, and Claude Code is the consulted model.
+
+Use `claude-coterie`
 
 ## What this version guarantees
 
